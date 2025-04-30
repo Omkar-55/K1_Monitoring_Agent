@@ -1,0 +1,69 @@
+# Cursor.rules for K1 Monitoring Agent
+
+## Azure OpenAI Guidelines
+- Always use environment variables for API keys and endpoints
+- Use async clients when possible for better performance
+- Initialize Azure OpenAI client with proper authentication:
+  ```python
+  from azure.openai import AsyncAzureOpenAI
+  
+  client = AsyncAzureOpenAI(
+      api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+      api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+      azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+  )
+  ```
+- Properly handle response objects and exceptions from the API
+- Use deployment_name instead of model name for Azure OpenAI:
+  ```python
+  response = await client.chat.completions.create(
+      deployment_name="gpt-4",
+      messages=[{"role": "user", "content": "Hello!"}],
+      temperature=0.7,
+      max_tokens=800
+  )
+  ```
+
+## AgentsSDK Guidelines
+- Create strongly typed Pydantic models for all agent inputs/outputs
+- Use BaseModel for all data structures:
+  ```python
+  from pydantic import BaseModel, Field
+  
+  class AgentInput(BaseModel):
+      query: str = Field(..., description="User query to the agent")
+      context: Optional[str] = Field(None, description="Additional context for the agent")
+  ```
+- Ensure all agent functions are type-annotated for both parameters and return values
+- Follow async patterns for agent functions:
+  ```python
+  async def process_agent_request(input_data: AgentInput) -> AgentResponse:
+      # Processing logic
+      return AgentResponse(result="processed data")
+  ```
+- Use proper error handling and return structured error responses
+- Implement proper logging for all agent activities
+
+## Tracing and Monitoring
+- Use consistent span naming convention for traces
+- Add appropriate attributes to spans for filtering and querying
+- Ensure all critical operations are traced:
+  ```python
+  with tracer.start_as_current_span("agent.process_request") as span:
+      span.set_attribute("user_id", user_id)
+      # Processing logic
+  ```
+- Log beginning and end of all significant operations
+- Include correlation IDs in logs for request tracing
+
+## Testing
+- Write tests for all agent components
+- Mock external API calls in tests
+- Test error handling and edge cases
+- Use parametrized tests for multiple input/output combinations
+
+## Documentation
+- Document all functions, classes, and methods
+- Include examples of usage in docstrings
+- Use type hints consistently throughout the codebase
+- Document expected exceptions and error scenarios 
