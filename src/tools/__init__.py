@@ -1,10 +1,33 @@
 """
-K1 Monitoring Agent - Tools Package
+Tools for the K1 Monitoring Agent.
 
-This package contains tools for the K1 Monitoring Agent.
+This module contains various tools used by the K1 Monitoring Agent.
 """
 
-from src.tools.databricks_tools import DatabricksTools
-from src.tools.azure_openai_tools import AzureOpenAITools
+# Import general tools
+from .azure_openai_tools import AzureOpenAITools
+from .databricks_tools import DatabricksTools
 
-__all__ = ["DatabricksTools", "AzureOpenAITools"] 
+# Import specialized Databricks monitoring tools
+from .databricks_monitoring import (
+    get_logs,
+    diagnose, 
+    FailureType,
+    suggest_fix, 
+    apply_fix,
+    verify,
+    final_report
+)
+
+__all__ = [
+    'AzureOpenAITools',
+    'DatabricksTools',
+    # Databricks monitoring tools
+    'get_logs',
+    'diagnose',
+    'FailureType',
+    'suggest_fix',
+    'apply_fix',
+    'verify',
+    'final_report'
+] 

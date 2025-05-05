@@ -1,13 +1,47 @@
 """
-Tools for verifying that applied fixes have resolved Databricks job issues.
+Tools for verifying fixes applied to Databricks jobs.
 """
 
-from typing import Literal
+import time
+from typing import Dict, Any, Optional
+from opentelemetry import trace
 
-def verify(run_id: str, timeout_minutes: int = 60, polling_interval_seconds: int = 30) -> Literal["success", "needs_retry", "failed"]:
+# Import the logging configuration
+from agent_core.logging_config import get_logger
+
+# Get logger for this module
+logger = get_logger(__name__)
+
+# Get tracer for this module
+tracer = trace.get_tracer(__name__)
+
+@tracer.start_as_current_span("verify")
+def verify(job_id: str, run_id: str) -> Dict[str, Any]:
     """
-    Poll a Databricks job run to verify if it completes successfully.
+    Verify if a fix applied to a Databricks job was successful.
+    
+    Args:
+        job_id: The ID of the Databricks job
+        run_id: The ID of the run to verify
+        
+    Returns:
+        Dictionary with verification result including status and details
     """
-    # For testing, always return success
-    print(f"Verifying run {run_id}")
-    return "success"
+    logger.info(f"Verifying fix for job {job_id}, run {run_id}")
+    
+    # In a real implementation, this would check the status of the run
+    # For simulation, we'll assume the run was successful
+    
+    # Simulate a successful run
+    status = "success"
+    details = "Run completed successfully"
+    duration = 300  # seconds
+    
+    return {
+        "status": status,
+        "details": details,
+        "job_id": job_id,
+        "run_id": run_id,
+        "duration": duration,
+        "timestamp": int(time.time())
+    } 
