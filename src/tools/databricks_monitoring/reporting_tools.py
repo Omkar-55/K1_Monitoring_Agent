@@ -4,212 +4,153 @@ Tools for generating reports about Databricks job monitoring.
 
 import time
 from typing import Dict, Any, List, Optional
-from opentelemetry import trace
 
 # Import the logging configuration
-from agent_core.logging_config import get_logger
+from src.agent_core.logging_config import get_logger
 
 # Get logger for this module
 logger = get_logger(__name__)
 
-# Get tracer for this module
-tracer = trace.get_tracer(__name__)
-
-@tracer.start_as_current_span("final_report")
-def final_report(report_data: Dict[str, Any]) -> str:
+def final_report(
+    issue_type: Optional[str], 
+    steps: List[Dict[str, Any]], 
+    fix_successful: Optional[bool] = None
+) -> str:
     """
-    Generate a final report for a Databricks job monitoring session.
+    Generate a final report for the monitoring run.
     
     Args:
-        report_data: Dictionary containing report information
+        issue_type: The type of issue that was detected, if any
+        steps: The reasoning steps taken during monitoring
+        fix_successful: Whether the fix was successful, if applicable
         
     Returns:
-        Formatted Markdown report
+        A formatted report string
     """
-    logger.info(f"Generating final report for job {report_data.get('job_id')} with {len(report_data.get('steps', []))} steps")
+    logger.info("Generating final report")
     
-    job_id = report_data.get("job_id", "unknown")
-    steps = report_data.get("steps", [])
-    issue_type = report_data.get("issue_type")
-    fix_attempts = report_data.get("fix_attempts", 0)
-    fix_successful = report_data.get("fix_successful", False)
+    # Start building the report
+    report = "# Databricks Monitoring Report\n\n"
     
-    # Extract various steps for the report
-    log_step = _find_step(steps, "log_collection")
-    diagnosis_steps = _find_all_steps(steps, "diagnosis")
-    fix_steps = _find_all_steps(steps, "fix_suggestion")
-    application_steps = _find_all_steps(steps, "fix_application")
-    verification_steps = _find_all_steps(steps, "verification")
+    # Add timestamp
+    report += f"**Generated at:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     
-    # Format the timestamp
-    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    # Add issue summary
+    report += "## Issue Summary\n\n"
     
-    # Generate the report in Markdown format
-    report = f"# Databricks Job Monitoring Report\n"
-    report += f"## Summary\n"
-    report += f"- **Job ID**: {job_id}\n"
-    report += f"- **Report Generated**: {current_time}\n"
-    report += f"- **Total Steps**: {len(steps)}\n"
-    report += f"- **Errors Detected**: {1 if issue_type else 0}\n"
-    report += f"- **Fixes Attempted**: {fix_attempts}\n"
-    report += f"- **Successful Fixes**: {1 if fix_successful else 0}\n"
-    report += f"\n"
+    if issue_type:
+        report += f"**Issue Type:** {issue_type}\n\n"
+    else:
+        report += "No issues detected.\n\n"
     
-    # Timeline
-    report += f"## Timeline\n"
-    for i, step in enumerate(steps, 1):
+    # Add resolution status
+    report += "## Resolution Status\n\n"
+    
+    if fix_successful is None:
+        report += "No fix was attempted.\n\n"
+    elif fix_successful:
+        report += "✅ **Fix was successful!**\n\n"
+    else:
+        report += "❌ **Fix was unsuccessful.**\n\n"
+    
+    # Add detailed steps
+    report += "## Monitoring Steps\n\n"
+    
+    for i, step in enumerate(steps):
         step_type = step.get("step", "unknown")
         timestamp = step.get("timestamp", 0)
-        time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else "unknown"
+        formatted_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+        result = step.get("result", "No result recorded")
         
-        if step_type == "log_collection":
-            run_id = step.get("logs_summary", {}).get("run_id", "unknown")
-            status = step.get("logs_summary", {}).get("status", "unknown")
-            report += f"{i}. **Logs** ({time_str}): Retrieved logs for run {run_id} (status: {status})\n"
-        elif step_type == "diagnosis":
-            issue = step.get("result", "No issue detected")
-            report += f"\n{i}. **Diagnosis** ({time_str}): {issue}\n"
-        elif step_type == "fix_suggestion":
-            attempt = step.get("attempt", "")
-            result = step.get("result", "No suggestion")
-            # Format the attempt number if it exists
-            attempt_str = f" (Attempt {attempt})" if attempt else ""
-            report += f"{i}. **Fix{attempt_str}** ({time_str}): {result}\n"
-        elif step_type == "fix_application":
-            attempt = step.get("attempt", "")
-            result = step.get("result", "No fix applied")
-            # Skip unsuccessful attempts to reduce noise
-            if "Fix applied: True" not in result:
-                continue
-            report += f"{i}. **Fix** ({time_str}): {result}\n"
-        elif step_type == "verification":
-            attempt = step.get("attempt", "")
-            result = step.get("result", "Unknown verification result")
-            run_id = step.get("new_run_id", "unknown")
-            report += f"{i}. **Verification** ({time_str}): Verified run {run_id} with result: {result.split(':')[-1].strip()}\n"
-    report += f"\n"
-    
-    # Diagnoses section
-    if diagnosis_steps:
-        report += f"## Diagnoses\n"
-        for i, step in enumerate(diagnosis_steps, 1):
-            result = step.get("result", "No diagnosis")
-            issue_parts = result.split(" - ", 1)
-            issue_type = issue_parts[0].replace("Diagnosed issue: ", "") if len(issue_parts) > 0 else "Unknown"
-            reasoning = issue_parts[1] if len(issue_parts) > 1 else "No reasoning provided"
-            
-            report += f"### Diagnosis {i}: {issue_type}\n"
-            report += f"**Reasoning**: {reasoning}\n\n"
-            
-            # Extract relevant logs if available
-            if log_step:
-                logs = log_step.get("logs_summary", {})
-                stderr = logs.get("stderr", "")
-                if stderr:
-                    # Show a snippet of the logs
-                    report += f"**Relevant Logs**:\n```\n{stderr[:500]}\n```\n\n"
-    
-    # Applied fixes section
-    if application_steps:
-        report += f"## Applied Fixes\n"
-        for i, step in enumerate(application_steps, 1):
-            result = step.get("result", "")
-            attempt = step.get("attempt", "")
-            
-            # Only include successful applications
-            if "Fix applied: True" not in result:
-                continue
-                
-            # Extract fix details
-            fix_step = _find_step(fix_steps, "fix_suggestion", attempt)
-            fix_result = fix_step.get("result", "") if fix_step else ""
-            fix_parts = fix_result.split(" - ", 1)
-            fix_type = fix_parts[0].replace("Suggested fix: ", "") if len(fix_parts) > 0 else "Unknown"
-            fix_desc = fix_parts[1] if len(fix_parts) > 1 else ""
-            
-            # Determine success based on verification
-            verification_step = _find_step(verification_steps, "verification", attempt)
-            success = "success" in verification_step.get("result", "").lower() if verification_step else False
-            
-            report += f"### Fix {i}: {fix_type} ({'✅ Successful' if success else '❌ Failed'})\n"
-            if fix_desc:
-                report += f"**Description**: {fix_desc}\n"
-                
-            # Check for parameters
-            if "parameters" in step:
-                params = step.get("parameters", {})
-                if params:
-                    report += "**Details**:\n"
-                    for key, value in params.items():
-                        report += f"- {key}: {value}\n"
+        report += f"### Step {i+1}: {step_type.replace('_', ' ').title()}\n\n"
+        report += f"**Time:** {formatted_time}\n\n"
+        
+        # Add attempt number if present
+        if "attempt" in step:
+            report += f"**Attempt:** {step['attempt']}\n\n"
+        
+        report += f"**Result:** {result}\n\n"
+        
+        # Add details if present
+        if "details" in step and step["details"]:
+            if isinstance(step["details"], str):
+                report += f"**Details:**\n\n```\n{step['details']}\n```\n\n"
+            else:
+                report += f"**Details:**\n\n```\n{step['details']}\n```\n\n"
+        
+        # Add hallucination check if present
+        if "hallucination_check" in step:
+            hallucination = step["hallucination_check"]
+            if hallucination.get("detected", False):
+                report += f"⚠️ **Hallucination Check:** Detected with score {hallucination.get('score', 'N/A')}\n\n"
+                report += f"**Reason:** {hallucination.get('reason', 'Unknown')}\n\n"
+            else:
+                report += "✅ **Hallucination Check:** No issues detected\n\n"
+        
+        # Add safety check if present
+        if "safety_check" in step:
+            safety = step["safety_check"]
+            if safety.get("issues_detected", False):
+                report += f"⚠️ **Safety Check:** Issues detected\n\n"
+                if "harmful_score" in safety:
+                    report += f"- Harmful content score: {safety['harmful_score']}\n"
+                if "harassment_score" in safety:
+                    report += f"- Harassment content score: {safety['harassment_score']}\n"
+                if "hate_score" in safety:
+                    report += f"- Hate content score: {safety['hate_score']}\n"
+                if "sexual_score" in safety:
+                    report += f"- Sexual content score: {safety['sexual_score']}\n"
+                if "self_harm_score" in safety:
+                    report += f"- Self-harm content score: {safety['self_harm_score']}\n"
+                report += "\n"
+    else:
+                report += "✅ **Safety Check:** No issues detected\n\n"
+        
+        # Add guardrail trigger information if present
+        if "guardrail_triggered" in step:
+            guardrail = step["guardrail_triggered"]
+            report += f"⚠️ **Guardrail Triggered:** {guardrail.get('message', 'Unknown reason')}\n\n"
+            report += f"**Step:** {guardrail.get('step', 'Unknown')}\n\n"
+        
+        # For diagnosis step, include logs summary if present
+        if step_type == "log_collection" and "logs_summary" in step:
+            logs_summary = step["logs_summary"]
+            report += "**Logs Summary:**\n\n"
+            for key, value in logs_summary.items():
+                report += f"- {key}: {value}\n"
+            report += "\n"
+        
+        # For fix suggestion, include parameters if present
+        if step_type == "fix_suggestion" and "parameters" in step:
+            params = step["parameters"]
+            report += "**Fix Parameters:**\n\n"
+            for key, value in params.items():
+                report += f"- {key}: {value}\n"
             report += "\n"
     
-    # Verifications section
-    if verification_steps:
-        report += f"## Verifications\n"
-        for i, step in enumerate(verification_steps, 1):
-            run_id = step.get("new_run_id", "unknown")
-            result = step.get("result", "")
-            success = "success" in result.lower()
-            duration = step.get("duration", 0)
-            
-            report += f"### Verification {i}: Run {run_id} ({'✅ Successful' if success else '❌ Failed'})\n"
-            if duration:
-                report += f"**Duration**: {duration} seconds\n\n"
+    # Add recommendations
+    report += "## Recommendations\n\n"
     
-    # Recommendations section
-    report += f"## Recommendations\n"
-    
-    if fix_successful:
-        report += f"✅ **Job is now running successfully**\n"
-        report += f"- Continue monitoring for any future issues\n"
-        if issue_type == "dependency_error":
-            report += f"- Consider setting up alerts for similar issues\n"
-        elif issue_type == "memory_exceeded":
-            report += f"- Monitor resource usage to ensure the new memory limits are sufficient\n"
-        elif issue_type == "disk_space_exceeded":
-            report += f"- Consider data cleanup to prevent future disk space issues\n"
-            report += f"- Set up alerts for disk utilization\n"
+    if issue_type == "memory_exceeded":
+        report += "- Consider optimizing the job's memory usage by refining data processing logic\n"
+        report += "- Monitor memory usage trends to proactively adjust cluster settings\n"
+        report += "- Implement checkpointing for large operations to minimize memory requirements\n"
+    elif issue_type == "disk_space_exceeded":
+        report += "- Implement regular data cleanup in your workflows\n"
+        report += "- Consider using more efficient data formats (Parquet, Delta)\n"
+        report += "- Monitor disk usage patterns and set up alerts\n"
+    elif issue_type == "dependency_error":
+        report += "- Document all required dependencies in cluster configuration\n"
+        report += "- Consider using an init script for consistent dependency installation\n"
+        report += "- Implement dependency version pinning to prevent compatibility issues\n"
     else:
-        report += f"❌ **Job is still failing**\n"
-        report += f"- Consider manual intervention and review\n"
-        if fix_attempts >= 3:
-            report += f"- The issue may require advanced troubleshooting beyond automated fixes\n"
-        if issue_type:
-            report += f"- Specifically review the {issue_type} issue\n"
+        report += "- Regular monitoring of job performance metrics\n"
+        report += "- Review logs periodically for potential issues\n"
+        report += "- Consider implementing automated alerts for failures\n"
     
-    return report
-
-def _find_step(steps: List[Dict[str, Any]], step_type: str, attempt: Any = None) -> Optional[Dict[str, Any]]:
-    """
-    Find a specific step in the list of steps.
+    # Add footer
+    report += "\n---\n"
+    report += "*This report was automatically generated by the Databricks Monitoring Agent.*\n"
     
-    Args:
-        steps: List of step dictionaries
-        step_type: Type of step to find
-        attempt: Optional attempt number to match
-        
-    Returns:
-        The step dictionary or None if not found
-    """
-    for step in steps:
-        if step.get("step") == step_type:
-            if attempt is not None:
-                if step.get("attempt") == attempt:
-                    return step
-            else:
-                return step
-    return None
-
-def _find_all_steps(steps: List[Dict[str, Any]], step_type: str) -> List[Dict[str, Any]]:
-    """
-    Find all steps of a given type.
-    
-    Args:
-        steps: List of step dictionaries
-        step_type: Type of steps to find
-        
-    Returns:
-        List of matching step dictionaries
-    """
-    return [step for step in steps if step.get("step") == step_type] 
+    logger.info("Final report generated successfully")
+    return report 

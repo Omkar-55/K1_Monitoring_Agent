@@ -8,8 +8,8 @@ during testing.
 
 import os
 import json
+import time
 from typing import Dict, Any, List, Optional, Union, Tuple
-from opentelemetry import trace
 from enum import Enum, auto
 
 # Import tenacity for retries
@@ -52,9 +52,6 @@ from .logging_config import get_logger
 
 # Initialize logger
 logger = get_logger(__name__)
-
-# Get tracer for this module
-tracer = trace.get_tracer(__name__)
 
 class RunStatus(Enum):
     """Enum for Databricks job run status."""
@@ -144,7 +141,8 @@ class DbxClient:
         return self._client is not None
     
     def _log_api_call(self, operation: str, params: Dict[str, Any], success: bool, 
-                      result_size: Optional[int] = None, error: Optional[Exception] = None) -> None:
+                      result_size: Optional[int] = None, error: Optional[Exception] = None,
+                      duration_seconds: Optional[float] = None) -> None:
         """
         Log structured information about an API call.
         
@@ -154,6 +152,7 @@ class DbxClient:
             success: Whether the operation was successful
             result_size: Size of the result if applicable
             error: Exception if the operation failed
+            duration_seconds: Time taken to complete the operation in seconds
         """
         log_data = {
             "operation": operation,
@@ -164,6 +163,9 @@ class DbxClient:
         
         if result_size is not None:
             log_data["result_size"] = result_size
+            
+        if duration_seconds is not None:
+            log_data["duration_seconds"] = f"{duration_seconds:.4f}"
             
         if error:
             log_data["error"] = str(error)
@@ -212,47 +214,58 @@ class DbxClient:
         """
         operation = "list_jobs"
         params = {"limit": limit, "name": name, "page_token": page_token}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.list_jobs") as span:
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return []
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        try:
+            # In newer SDK versions, list() returns a generator directly
+            jobs_generator = self._client.jobs.list(
+                limit=limit, 
+                name=name,
+                page_token=page_token
+            )
             
-            try:
-                # In newer SDK versions, list() returns a generator directly
-                jobs_generator = self._client.jobs.list(
-                    limit=limit, 
-                    name=name,
-                    page_token=page_token
-                )
-                
-                # Convert generator to list and extract dictionaries
-                jobs_list = list(jobs_generator)
-                result = [job.as_dict() if hasattr(job, 'as_dict') else job for job in jobs_list]
-                
-                # Apply limit if specified
-                if limit and len(result) > limit:
-                    result = result[:limit]
-                
-                # Set span attributes
-                span.set_attribute("jobs.count", len(result))
-                if name:
-                    span.set_attribute("jobs.filter.name", name)
-                
-                # Log the successful call with structured data
-                self._log_api_call(operation, params, True, result_size=len(result))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error listing jobs: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                
-                # Log the failed call
-                self._log_api_call(operation, params, False, error=e)
-                return []
+            # Convert generator to list and extract dictionaries
+            jobs_list = list(jobs_generator)
+            result = [job.as_dict() if hasattr(job, 'as_dict') else job for job in jobs_list]
+            
+            # Apply limit if specified
+            if limit and len(result) > limit:
+                result = result[:limit]
+            
+            # Log duration and other metadata
+            duration = time.time() - start_time
+            logger.info(f"Listed {len(result)} jobs in {duration:.4f} seconds")
+            
+            # Log the successful call with structured data
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(result),
+                duration_seconds=duration
+            )
+            
+            return result
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error listing jobs: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            # Log the failed call
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return []
     
     @api_retry
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
@@ -267,36 +280,56 @@ class DbxClient:
         """
         operation = "get_job"
         params = {"job_id": job_id}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_job") as span:
-            span.set_attribute("job.id", job_id)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return None
+        
+        try:
+            job = self._client.jobs.get(job_id=job_id)
+            result = job.as_dict() if job else None
+        
+            # Log duration
+            duration = time.time() - start_time
+            logger.info(f"Retrieved job {job_id} in {duration:.4f} seconds")
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return None
+            # Log the successful call with structured data
+            self._log_api_call(
+                operation, 
+                params, 
+                True,
+                duration_seconds=duration
+            )
             
-            try:
-                job = self._client.jobs.get(job_id=job_id)
-                result = job.as_dict() if job else None
-                
-                # Log the successful call with structured data
-                self._log_api_call(operation, params, True)
-                
-                return result
-            except ResourceDoesNotExist:
-                logger.warning(f"Job {job_id} not found")
-                self._log_api_call(operation, params, False, error=ResourceDoesNotExist(f"Job {job_id} not found"))
-                return None
-            except Exception as e:
-                logger.error(f"Error getting job {job_id}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                
-                # Log the failed call
-                self._log_api_call(operation, params, False, error=e)
-                return None
+            return result
+        except ResourceDoesNotExist:
+            duration = time.time() - start_time
+            logger.warning(f"Job {job_id} not found. Operation took {duration:.4f} seconds")
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=ResourceDoesNotExist(f"Job {job_id} not found"),
+                duration_seconds=duration
+            )
+            return None
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting job {job_id}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            # Log the failed call
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return None
     
     @api_retry
     def list_runs(self, 
@@ -326,48 +359,60 @@ class DbxClient:
             "offset": offset,
             "limit": limit
         }
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.list_runs") as span:
-            if job_id:
-                span.set_attribute("job.id", job_id)
-            span.set_attribute("active_only", active_only)
-            span.set_attribute("completed_only", completed_only)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        try:
+            # In newer SDK versions, list_runs() returns a generator directly
+            runs_generator = self._client.jobs.list_runs(
+                job_id=job_id,
+                active_only=active_only,
+                completed_only=completed_only,
+                offset=offset,
+                limit=limit
+            )
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return []
+            # Convert generator to list and extract dictionaries
+            runs_list = list(runs_generator)
+            result = [run.as_dict() if hasattr(run, 'as_dict') else run for run in runs_list]
             
-            try:
-                # In newer SDK versions, list_runs() returns a generator directly
-                runs_generator = self._client.jobs.list_runs(
-                    job_id=job_id,
-                    active_only=active_only,
-                    completed_only=completed_only,
-                    offset=offset,
-                    limit=limit
-                )
-                
-                # Convert generator to list and extract dictionaries
-                runs_list = list(runs_generator)
-                result = [run.as_dict() if hasattr(run, 'as_dict') else run for run in runs_list]
-                
-                # Apply limit if specified
-                if limit and len(result) > limit:
-                    result = result[:limit]
-                
-                # Set span attributes and log data
-                span.set_attribute("runs.count", len(result))
-                self._log_api_call(operation, params, True, result_size=len(result))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error listing job runs: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return []
+            # Apply limit if specified
+            if limit and len(result) > limit:
+                result = result[:limit]
+            
+            # Log duration and results
+            duration = time.time() - start_time
+            job_id_str = f" for job {job_id}" if job_id else ""
+            logger.info(f"Listed {len(result)} runs{job_id_str} in {duration:.4f} seconds")
+            
+            # Log structured data
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(result),
+                duration_seconds=duration
+            )
+            
+            return result
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error listing job runs: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return []
     
     @api_retry
     def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
@@ -382,31 +427,54 @@ class DbxClient:
         """
         operation = "get_run"
         params = {"run_id": run_id}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_run") as span:
-            span.set_attribute("run.id", run_id)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return None
+        
+        try:
+            run = self._client.jobs.get_run(run_id=run_id)
+            result = run.as_dict() if run else None
+        
+            # Log duration
+            duration = time.time() - start_time
+            logger.info(f"Retrieved run {run_id} in {duration:.4f} seconds")
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return None
+            self._log_api_call(
+                operation, 
+                params, 
+                True,
+                duration_seconds=duration
+            )
+            return result
+        except ResourceDoesNotExist:
+            duration = time.time() - start_time
+            logger.warning(f"Run {run_id} not found. Operation took {duration:.4f} seconds")
             
-            try:
-                run = self._client.jobs.get_run(run_id=run_id)
-                result = run.as_dict() if run else None
-                self._log_api_call(operation, params, True)
-                return result
-            except ResourceDoesNotExist:
-                logger.warning(f"Run {run_id} not found")
-                self._log_api_call(operation, params, False, error=ResourceDoesNotExist(f"Run {run_id} not found"))
-                return None
-            except Exception as e:
-                logger.error(f"Error getting run {run_id}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return None
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=ResourceDoesNotExist(f"Run {run_id} not found"),
+                duration_seconds=duration
+            )
+            return None
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting run {run_id}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return None
     
     def get_run_status(self, run_id: str) -> Tuple[RunStatus, Optional[str]]:
         """
@@ -420,51 +488,69 @@ class DbxClient:
         """
         operation = "get_run_status"
         params = {"run_id": run_id}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_run_status") as span:
-            span.set_attribute("run.id", run_id)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return RunStatus.UNKNOWN, "Client not available"
+        
+        try:
+            run = self._client.jobs.get_run(run_id=run_id)
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return RunStatus.UNKNOWN, "Client not available"
+            if not run or not run.state:
+                duration = time.time() - start_time
+                self._log_api_call(
+                    operation, 
+                    params, 
+                    False, 
+                    error=ValueError(f"Run {run_id} has no state information"),
+                    duration_seconds=duration
+                )
+                return RunStatus.UNKNOWN, "No state information"
             
-            try:
-                run = self._client.jobs.get_run(run_id=run_id)
-                
-                if not run or not run.state:
-                    self._log_api_call(operation, params, False, 
-                                      error=ValueError(f"Run {run_id} has no state information"))
-                    return RunStatus.UNKNOWN, "No state information"
-                
-                # Extract status information
-                life_cycle_state = run.state.life_cycle_state if run.state.life_cycle_state else "UNKNOWN"
-                state_message = run.state.state_message if run.state.state_message else None
-                
-                # Map to our status enum
-                status_map = {
-                    "PENDING": RunStatus.PENDING,
-                    "RUNNING": RunStatus.RUNNING,
-                    "TERMINATING": RunStatus.RUNNING,
-                    "TERMINATED": RunStatus.TERMINATED,
-                    "SKIPPED": RunStatus.SKIPPED,
-                    "INTERNAL_ERROR": RunStatus.INTERNAL_ERROR
-                }
-                
-                status = status_map.get(life_cycle_state, RunStatus.UNKNOWN)
-                
-                # Set span attributes and log data
-                span.set_attribute("run.status", life_cycle_state)
-                self._log_api_call(operation, params, True)
-                
-                return status, state_message
-            except Exception as e:
-                logger.error(f"Error getting run status for {run_id}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return RunStatus.UNKNOWN, str(e)
+            # Extract status information
+            life_cycle_state = run.state.life_cycle_state if run.state.life_cycle_state else "UNKNOWN"
+            state_message = run.state.state_message if run.state.state_message else None
+            
+            # Map to our status enum
+            status_map = {
+                "PENDING": RunStatus.PENDING,
+                "RUNNING": RunStatus.RUNNING,
+                "TERMINATING": RunStatus.RUNNING,
+                "TERMINATED": RunStatus.TERMINATED,
+                "SKIPPED": RunStatus.SKIPPED,
+                "INTERNAL_ERROR": RunStatus.INTERNAL_ERROR
+            }
+            
+            status = status_map.get(life_cycle_state, RunStatus.UNKNOWN)
+            
+            # Log duration and status
+            duration = time.time() - start_time
+            logger.info(f"Retrieved status '{life_cycle_state}' for run {run_id} in {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                True,
+                duration_seconds=duration
+            )
+            
+            return status, state_message
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting run status for {run_id}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return RunStatus.UNKNOWN, str(e)
     
     # =========================================================================
     # Clusters API Methods
@@ -480,30 +566,45 @@ class DbxClient:
         """
         operation = "list_clusters"
         params = {}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.list_clusters") as span:
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return []
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        try:
+            # Convert generator to list directly
+            clusters_list = list(self._client.clusters.list())
+            result = [cluster.as_dict() if hasattr(cluster, 'as_dict') else cluster for cluster in clusters_list]
             
-            try:
-                # Convert generator to list directly
-                clusters_list = list(self._client.clusters.list())
-                result = [cluster.as_dict() if hasattr(cluster, 'as_dict') else cluster for cluster in clusters_list]
-                
-                # Set span attributes and log data
-                span.set_attribute("clusters.count", len(result))
-                self._log_api_call(operation, params, True, result_size=len(result))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error listing clusters: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return []
+            # Log duration and results
+            duration = time.time() - start_time
+            logger.info(f"Listed {len(result)} clusters in {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(result),
+                duration_seconds=duration
+            )
+            
+            return result
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error listing clusters: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return []
     
     @api_retry
     def get_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
@@ -518,32 +619,55 @@ class DbxClient:
         """
         operation = "get_cluster"
         params = {"cluster_id": cluster_id}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_cluster") as span:
-            span.set_attribute("cluster.id", cluster_id)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return None
+        
+        try:
+            cluster = self._client.clusters.get(cluster_id=cluster_id)
+            result = cluster.as_dict() if cluster else None
+        
+            # Log duration
+            duration = time.time() - start_time
+            logger.info(f"Retrieved cluster {cluster_id} in {duration:.4f} seconds")
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return None
+            self._log_api_call(
+                operation, 
+                params, 
+                True,
+                duration_seconds=duration
+            )
             
-            try:
-                cluster = self._client.clusters.get(cluster_id=cluster_id)
-                result = cluster.as_dict() if cluster else None
-                self._log_api_call(operation, params, True)
-                return result
-            except ResourceDoesNotExist:
-                logger.warning(f"Cluster {cluster_id} not found")
-                self._log_api_call(operation, params, False, 
-                                  error=ResourceDoesNotExist(f"Cluster {cluster_id} not found"))
-                return None
-            except Exception as e:
-                logger.error(f"Error getting cluster {cluster_id}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return None
+            return result
+        except ResourceDoesNotExist:
+            duration = time.time() - start_time
+            logger.warning(f"Cluster {cluster_id} not found. Operation took {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=ResourceDoesNotExist(f"Cluster {cluster_id} not found"),
+                duration_seconds=duration
+            )
+            return None
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting cluster {cluster_id}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return None
     
     # =========================================================================
     # Workspace API Methods
@@ -552,119 +676,184 @@ class DbxClient:
     @api_retry
     def list_workspaces(self, path: str) -> List[Dict[str, Any]]:
         """
-        List objects in a workspace directory.
+        List workspace items.
         
         Args:
-            path: The directory path
+            path: Workspace path to list
             
         Returns:
             List of workspace objects
         """
         operation = "list_workspaces"
         params = {"path": path}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.list_workspaces") as span:
-            span.set_attribute("workspace.path", path)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        try:
+            workspace_list = list(self._client.workspace.list(path=path))
+            result = [item.as_dict() if hasattr(item, 'as_dict') else item for item in workspace_list]
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return []
+            # Log duration and results
+            duration = time.time() - start_time
+            logger.info(f"Listed {len(result)} workspace items at {path} in {duration:.4f} seconds")
             
-            try:
-                objects_list = list(self._client.workspace.list(path=path))
-                result = [obj.as_dict() for obj in objects_list]
-                
-                # Set span attributes and log data
-                span.set_attribute("workspace.objects.count", len(result))
-                self._log_api_call(operation, params, True, result_size=len(result))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error listing workspace objects at {path}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return []
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(result),
+                duration_seconds=duration
+            )
+            
+            return result
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error listing workspace items at {path}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return []
     
     @api_retry
     def get_workspace_status(self, workspace_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get workspace status.
+        Get workspace status by ID.
         
         Args:
-            workspace_id: The workspace ID
+            workspace_id: The workspace item ID
             
         Returns:
             Workspace status or None if not found
         """
         operation = "get_workspace_status"
         params = {"workspace_id": workspace_id}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_workspace_status") as span:
-            span.set_attribute("workspace.id", workspace_id)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return None
+        
+        try:
+            # This is a placeholder as the actual implementation depends on the specific SDK version
+            # In some versions, it might be workspace.get_status(), in others just workspace.get()
+            # Adjust this based on your SDK version
+            if hasattr(self._client.workspace, 'get_status'):
+                workspace = self._client.workspace.get_status(id=workspace_id)
+            else:
+                workspace = self._client.workspace.get(path=workspace_id)  # Using path as fallback
+                
+            result = workspace.as_dict() if workspace else None
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return None
+            # Log duration
+            duration = time.time() - start_time
+            logger.info(f"Retrieved workspace {workspace_id} in {duration:.4f} seconds")
             
-            try:
-                status = self._client.workspace.get_status(workspace_id=workspace_id)
-                result = status.as_dict() if status else None
-                self._log_api_call(operation, params, True)
-                return result
-            except ResourceDoesNotExist:
-                logger.warning(f"Workspace {workspace_id} not found")
-                self._log_api_call(operation, params, False, 
-                                  error=ResourceDoesNotExist(f"Workspace {workspace_id} not found"))
-                return None
-            except Exception as e:
-                logger.error(f"Error getting workspace status for {workspace_id}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return None
+            self._log_api_call(
+                operation, 
+                params, 
+                True,
+                duration_seconds=duration
+            )
+            
+            return result
+        except ResourceDoesNotExist:
+            duration = time.time() - start_time
+            logger.warning(f"Workspace {workspace_id} not found. Operation took {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=ResourceDoesNotExist(f"Workspace {workspace_id} not found"),
+                duration_seconds=duration
+            )
+            return None
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting workspace {workspace_id}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return None
     
     # =========================================================================
-    # SQL API Methods
+    # SQL Warehouses API Methods
     # =========================================================================
     
     @api_retry
     def list_warehouses(self) -> List[Dict[str, Any]]:
         """
-        List SQL warehouses in the workspace.
+        List SQL warehouses.
         
         Returns:
-            List of SQL warehouse objects
+            List of warehouse objects
         """
         operation = "list_warehouses"
         params = {}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.list_warehouses") as span:
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        try:
+            # Check if SQL API is available - it might not be in all Databricks SDK versions
+            if not hasattr(self._client, 'warehouses'):
+                error_msg = "SQL Warehouses API not available in this version of Databricks SDK"
+                logger.warning(error_msg)
                 self._log_api_call(operation, params, False, error=ValueError(error_msg))
                 return []
+                
+            warehouses_list = list(self._client.warehouses.list())
+            result = [warehouse.as_dict() if hasattr(warehouse, 'as_dict') else warehouse for warehouse in warehouses_list]
             
-            try:
-                warehouses_list = list(self._client.warehouses.list())
-                result = [warehouse.as_dict() for warehouse in warehouses_list]
-                
-                # Set span attributes and log data
-                span.set_attribute("warehouses.count", len(result))
-                self._log_api_call(operation, params, True, result_size=len(result))
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error listing SQL warehouses: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return []
+            # Log duration and results
+            duration = time.time() - start_time
+            logger.info(f"Listed {len(result)} SQL warehouses in {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(result),
+                duration_seconds=duration
+            )
+            
+            return result
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error listing SQL warehouses: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return []
     
     @api_retry
     def get_warehouse(self, warehouse_id: str) -> Optional[Dict[str, Any]]:
@@ -679,35 +868,65 @@ class DbxClient:
         """
         operation = "get_warehouse"
         params = {"warehouse_id": warehouse_id}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_warehouse") as span:
-            span.set_attribute("warehouse.id", warehouse_id)
-            
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return None
+        
+        try:
+            # Check if SQL API is available - it might not be in all Databricks SDK versions
+            if not hasattr(self._client, 'warehouses'):
+                error_msg = "SQL Warehouses API not available in this version of Databricks SDK"
+                logger.warning(error_msg)
                 self._log_api_call(operation, params, False, error=ValueError(error_msg))
                 return None
+                
+            warehouse = self._client.warehouses.get(id=warehouse_id)
+            result = warehouse.as_dict() if warehouse else None
+        
+            # Log duration
+            duration = time.time() - start_time
+            logger.info(f"Retrieved warehouse {warehouse_id} in {duration:.4f} seconds")
             
-            try:
-                warehouse = self._client.warehouses.get(id=warehouse_id)
-                result = warehouse.as_dict() if warehouse else None
-                self._log_api_call(operation, params, True)
-                return result
-            except ResourceDoesNotExist:
-                logger.warning(f"Warehouse {warehouse_id} not found")
-                self._log_api_call(operation, params, False, 
-                                  error=ResourceDoesNotExist(f"Warehouse {warehouse_id} not found"))
-                return None
-            except Exception as e:
-                logger.error(f"Error getting SQL warehouse {warehouse_id}: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return None
+            self._log_api_call(
+                operation, 
+                params, 
+                True,
+                duration_seconds=duration
+            )
+            
+            return result
+        except ResourceDoesNotExist:
+            duration = time.time() - start_time
+            logger.warning(f"Warehouse {warehouse_id} not found. Operation took {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=ResourceDoesNotExist(f"Warehouse {warehouse_id} not found"),
+                duration_seconds=duration
+            )
+            return None
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting warehouse {warehouse_id}: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return None
     
     # =========================================================================
-    # Logging API Methods
+    # Log Retrieval Methods
     # =========================================================================
     
     @api_retry
@@ -721,7 +940,7 @@ class DbxClient:
                 limit: int = 100,
                 log_type: str = "audit") -> List[Dict[str, Any]]:
         """
-        Get logs from Databricks cluster, job run, or workspace.
+        Retrieve logs from Databricks.
         
         Args:
             cluster_id: Filter logs by cluster ID
@@ -730,8 +949,8 @@ class DbxClient:
             end_time: End time in milliseconds since epoch
             page_token: Token for pagination
             offset: Pagination offset
-            limit: Maximum number of log entries to return
-            log_type: Type of logs to retrieve (audit, cluster, run)
+            limit: Maximum number of logs to return
+            log_type: Type of logs to retrieve (audit, driver, stdout, stderr, etc.)
             
         Returns:
             List of log entries
@@ -747,158 +966,151 @@ class DbxClient:
             "limit": limit,
             "log_type": log_type
         }
+        start_time_exec = time.time()
         
-        with tracer.start_as_current_span("databricks.get_logs") as span:
-            if cluster_id:
-                span.set_attribute("cluster.id", cluster_id)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        # Based on what's provided, decide which API to use
+        try:
+            result = []
+            
             if run_id:
-                span.set_attribute("run.id", run_id)
-            span.set_attribute("log_type", log_type)
-            
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return []
-            
-            try:
-                results = []
+                # Get run logs - typically stdout and stderr
+                # First, get the run details to find out its cluster_id
+                run_details = self.get_run(run_id)
+                if not run_details:
+                    logger.warning(f"Cannot get logs: Run {run_id} not found")
+                    return []
+                    
+                # Check if the run has a cluster_id
+                run_cluster_id = None
+                if 'cluster_instance' in run_details:
+                    run_cluster_id = run_details.get('cluster_instance', {}).get('cluster_id')
                 
-                # Get cluster logs if cluster_id is provided
-                if cluster_id:
-                    # Try to get logs from cluster-level API
+                # If we have a run and its cluster, we can get logs
+                if run_cluster_id:
+                    # Try to get the logs for this run's cluster
+                    run_logs = {}
+                    
+                    # Try to get stdout logs
                     try:
-                        logs = self._client.clusters.get_events(
+                        stdout_logs = self._client.jobs.get_run_output(run_id=run_id)
+                        if stdout_logs and hasattr(stdout_logs, 'as_dict'):
+                            stdout_dict = stdout_logs.as_dict()
+                            if 'logs' in stdout_dict:
+                                run_logs['stdout'] = stdout_dict['logs']
+                    except Exception as e:
+                        logger.warning(f"Error getting stdout logs for run {run_id}: {e}")
+                        run_logs['stdout'] = ""
+                    
+                    # Try to get stderr logs if available
+                    # Note: In newer Databricks SDK versions, stderr might be included in stdout logs
+                    try:
+                        # For some SDK versions, there might be a specific stderr endpoint
+                        if hasattr(self._client.jobs, 'get_run_stderr'):
+                            stderr_logs = self._client.jobs.get_run_stderr(run_id=run_id)
+                            if stderr_logs:
+                                run_logs['stderr'] = stderr_logs
+                    except Exception as e:
+                        logger.debug(f"Error getting separate stderr logs for run {run_id}: {e}")
+                        run_logs['stderr'] = ""
+                    
+                    # Add metadata to the result
+                    result = [{
+                        'run_id': run_id,
+                        'job_id': run_details.get('job_id'),
+                        'status': run_details.get('state', {}).get('state_message'),
+                        'logs': run_logs,
+                        'metadata': {
+                            'cluster_id': run_cluster_id,
+                            'start_time': run_details.get('start_time'),
+                            'end_time': run_details.get('end_time'),
+                            'run_name': run_details.get('run_name'),
+                            'run_page_url': run_details.get('run_page_url')
+                        }
+                    }]
+            
+            elif cluster_id:
+                # Get cluster logs - requires appropriate permissions
+                # Not all SDK versions have direct log access, so have a fallback plan
+                try:
+                    if hasattr(self._client.clusters, 'get_logs'):
+                        logs = self._client.clusters.get_logs(
                             cluster_id=cluster_id,
-                            start_time=start_time,
-                            end_time=end_time,
-                            limit=limit,
-                            offset=offset
+                            start=offset,
+                            end=offset+limit,
+                            log_type=log_type
                         )
-                        
-                        # Convert to list of dictionaries
-                        events = list(logs)
-                        for event in events:
-                            if hasattr(event, 'as_dict'):
-                                results.append(event.as_dict())
-                            else:
-                                results.append(event)
-                    except Exception as cluster_error:
-                        logger.warning(f"Could not get cluster events: {cluster_error}")
-                
-                # Get run logs if run_id is provided
-                if run_id and not results:
-                    try:
-                        # Try to access logs using the runs API
-                        logs = self._client.jobs.get_run_output(run_id=run_id)
-                        if hasattr(logs, 'as_dict'):
-                            log_output = logs.as_dict()
-                            
-                            # Extract logs from different sources
-                            if 'logs' in log_output:
-                                results.append({"logs": log_output['logs']})
-                            if 'error' in log_output:
-                                results.append({"error": log_output['error']})
+                        if logs and hasattr(logs, 'as_dict'):
+                            result = [logs.as_dict()]
                         else:
-                            results.append(logs)
-                    except Exception as run_error:
-                        logger.warning(f"Could not get run logs: {run_error}")
-                
-                # Fall back to querying workspace audit logs
-                if not results and log_type == "audit":
-                    try:
-                        # Try to get audit logs using a direct API call
-                        import time
-                        import requests
-                        
-                        # Default to last 24 hours if not specified
-                        if not start_time:
-                            start_time = int((time.time() - 86400) * 1000)  # 24 hours ago
-                        if not end_time:
-                            end_time = int(time.time() * 1000)  # now
-                        
-                        # Make direct API call instead of using the SDK
-                        headers = {
-                            "Authorization": f"Bearer {self.token}",
-                            "Content-Type": "application/json"
-                        }
-                        
-                        # Build the request URL - use the audit logs API which is more widely available
-                        api_url = f"{self.host}/api/2.0/accounts/get-audit-logs"
-                        
-                        # Format the start and end times for the audit logs API
-                        from datetime import datetime
-                        start_time_str = datetime.fromtimestamp(start_time / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        end_time_str = datetime.fromtimestamp(end_time / 1000).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        
-                        # Build the request body
-                        filter_body = {
-                            "start_time": start_time_str,
-                            "end_time": end_time_str,
-                            "max_results": limit
-                        }
-                        
-                        # Make the API call
-                        response = requests.post(api_url, headers=headers, json=filter_body)
-                        
-                        if response.status_code == 200:
-                            data = response.json()
-                            if "audit_logs" in data:
-                                results = data["audit_logs"]
-                                logger.info(f"Retrieved {len(results)} audit log entries")
-                            else:
-                                logger.info("No audit logs found in the response")
+                            result = [{'logs': logs, 'cluster_id': cluster_id}]
+                    else:
+                        # Alternative log retrieval through events API if available
+                        events_api_available = hasattr(self._client.clusters, 'events')
+                        if events_api_available:
+                            events = list(self._client.clusters.events(
+                                cluster_id=cluster_id,
+                                limit=limit,
+                                order='DESC'
+                            ))
+                            result = [{'events': [e.as_dict() if hasattr(e, 'as_dict') else e for e in events], 
+                                     'cluster_id': cluster_id}]
                         else:
-                            logger.warning(f"Audit logs API call failed: {response.status_code} - {response.text}")
-                            
-                            # Try the Workspace Audit Logs API instead
-                            try:
-                                api_url = f"{self.host}/api/2.0/workspace-logs"
-                                
-                                # Build the request body
-                                filter_body = {
-                                    "start_time": start_time_str,
-                                    "end_time": end_time_str,
-                                    "page_size": limit
-                                }
-                                
-                                # Make the API call
-                                response = requests.get(api_url, headers=headers, params=filter_body)
-                                
-                                if response.status_code == 200:
-                                    data = response.json()
-                                    if "events" in data:
-                                        results = data["events"]
-                                        logger.info(f"Retrieved {len(results)} workspace log entries")
-                                    else:
-                                        logger.info("No workspace logs found in the response")
-                                else:
-                                    logger.warning(f"Workspace logs API call failed: {response.status_code} - {response.text}")
-                            except Exception as workspace_error:
-                                logger.warning(f"Could not get workspace logs: {workspace_error}")
-                    except Exception as audit_error:
-                        logger.warning(f"Could not get audit logs: {audit_error}")
-                
-                # Apply limit if needed
-                if limit and len(results) > limit:
-                    results = results[:limit]
-                
-                # Log the API call
-                self._log_api_call(operation, params, True, result_size=len(results))
-                span.set_attribute("logs.count", len(results))
-                
-                return results
-            except Exception as e:
-                logger.error(f"Error getting logs: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return []
+                            logger.warning("Cluster logs API not available in this SDK version")
+                except Exception as e:
+                    logger.warning(f"Error accessing cluster logs: {e}")
+                    # Fallback - at least return basic info about the cluster
+                    cluster_info = self.get_cluster(cluster_id)
+                    if cluster_info:
+                        result = [{'cluster_info': cluster_info, 'logs': {log_type: "Log retrieval not supported"}}]
+            
+            else:
+                # No specific target - try audit logs or workspace-level logs if available
+                # This is very dependent on the SDK version and permissions
+                logger.warning("General log retrieval without run_id or cluster_id is not well supported")
+                result = [{'warning': 'Log retrieval requires run_id or cluster_id'}]
+            
+            # Log duration and results
+            duration = time.time() - start_time_exec
+            logger.info(f"Retrieved logs in {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(result),
+                duration_seconds=duration
+            )
+            
+            return result
+            
+        except Exception as e:
+            duration = time.time() - start_time_exec
+            logger.error(f"Error retrieving logs: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return []
+    
+    # =========================================================================
+    # Activity Monitoring
+    # =========================================================================
     
     @api_retry
     def get_activity(self, days: int = 7, limit: int = 100) -> List[Dict[str, Any]]:
         """
-        Get user activity information from the workspace.
+        Get recent activity (job runs, cluster events) from Databricks.
         
         Args:
             days: Number of days of history to retrieve
@@ -908,134 +1120,130 @@ class DbxClient:
             List of activity entries
         """
         operation = "get_activity"
-        params = {
-            "days": days,
-            "limit": limit
-        }
+        params = {"days": days, "limit": limit}
+        start_time = time.time()
         
-        with tracer.start_as_current_span("databricks.get_activity") as span:
-            span.set_attribute("days", days)
+        if not self.is_available():
+            error_msg = "Databricks client not available"
+            logger.error(error_msg)
+            self._log_api_call(operation, params, False, error=ValueError(error_msg))
+            return []
+        
+        # We need to assemble activity from multiple API endpoints
+        try:
+            activity = []
             
-            if not self.is_available():
-                error_msg = "Databricks client not available"
-                logger.error(error_msg)
-                self._log_api_call(operation, params, False, error=ValueError(error_msg))
-                return []
-            
+            # 1. Recent job runs
             try:
-                results = []
+                # Calculate the millisecond timestamp for X days ago
+                start_time_ms = int((time.time() - (days * 24 * 60 * 60)) * 1000)
                 
-                # First try to get users in the workspace to reconstruct activity
-                try:
-                    import requests
-                    import time
-                    from datetime import datetime, timedelta
-                    
-                    # Make direct API call instead of using the SDK for SCIM API
-                    headers = {
-                        "Authorization": f"Bearer {self.token}",
-                        "Content-Type": "application/scim+json"
-                    }
-                    
-                    # Build the request URL
-                    api_url = f"{self.host}/api/2.0/preview/scim/v2/Users"
-                    
-                    # Construct query to get users
-                    response = requests.get(api_url, headers=headers)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        if "Resources" in data:
-                            users = data["Resources"]
-                            logger.info(f"Retrieved {len(users)} user records")
-                            
-                            for user in users:
-                                # Extract last activity information if available
-                                user_id = user.get("id")
-                                name = user.get("userName")
-                                display_name = user.get("displayName", name)
-                                active = user.get("active", False)
-                                
-                                # Try to get last login time from meta
-                                meta = user.get("meta", {})
-                                last_modified = meta.get("lastModified")
-                                
-                                # For each user, build an activity record
-                                activity = {
-                                    "user_id": user_id,
-                                    "user_name": name,
-                                    "display_name": display_name,
-                                    "active": active,
-                                    "last_activity": last_modified or "Unknown",
-                                    "timestamp": int(time.time() * 1000),  # Current time in ms
-                                    "type": "user_information"
-                                }
-                                
-                                results.append(activity)
-                        else:
-                            logger.info("No users found in the response")
-                    else:
-                        logger.warning(f"SCIM API call failed: {response.status_code} - {response.text}")
-                        
-                except Exception as user_error:
-                    logger.warning(f"Could not get user activity information: {user_error}")
+                # Get recent job runs 
+                runs = self.list_runs(limit=limit)
                 
-                # Next, try to get cluster usage information
-                try:
-                    clusters = self.list_clusters()
-                    for cluster in clusters:
-                        cluster_id = cluster.get("cluster_id")
-                        cluster_name = cluster.get("cluster_name")
-                        creator = cluster.get("creator_user_name", "Unknown")
-                        
-                        # Try to parse creation timestamp
-                        created = cluster.get("cluster_source", {}).get("created_time")
-                        
-                        activity = {
-                            "cluster_id": cluster_id,
-                            "cluster_name": cluster_name,
-                            "creator": creator,
-                            "created_time": created,
-                            "state": cluster.get("state"),
-                            "timestamp": int(time.time() * 1000),
-                            "type": "cluster_information"
+                # Filter by date if needed
+                if start_time_ms > 0:
+                    runs = [r for r in runs if r.get('start_time', 0) >= start_time_ms]
+                
+                # Add runs to activity
+                for run in runs:
+                    activity.append({
+                        'type': 'job_run',
+                        'id': run.get('run_id'),
+                        'time': run.get('start_time'),
+                        'status': run.get('state', {}).get('life_cycle_state'),
+                        'result': run.get('state', {}).get('result_state'),
+                        'details': {
+                            'job_id': run.get('job_id'),
+                            'run_name': run.get('run_name'),
+                            'creator': run.get('creator_user_name')
                         }
-                        
-                        results.append(activity)
-                except Exception as cluster_error:
-                    logger.warning(f"Could not get cluster activity: {cluster_error}")
-                
-                # Also get workspace objects to provide some workspace activity
-                try:
-                    # Get objects from workspace root
-                    workspace_objects = self.list_workspaces("/")
-                    
-                    for obj in workspace_objects:
-                        activity = {
-                            "path": obj.get("path"),
-                            "object_type": obj.get("object_type"),
-                            "language": obj.get("language") if "language" in obj else None,
-                            "object_id": obj.get("object_id"),
-                            "timestamp": int(time.time() * 1000),
-                            "type": "workspace_object"
-                        }
-                        
-                        results.append(activity)
-                except Exception as workspace_error:
-                    logger.warning(f"Could not get workspace objects: {workspace_error}")
-                
-                # Apply limit if needed
-                if limit and len(results) > limit:
-                    results = results[:limit]
-                
-                # Log the API call
-                self._log_api_call(operation, params, True, result_size=len(results))
-                span.set_attribute("activity.count", len(results))
-                
-                return results
+                    })
             except Exception as e:
-                logger.error(f"Error getting activity: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                self._log_api_call(operation, params, False, error=e)
-                return [] 
+                logger.warning(f"Error getting job runs for activity: {e}")
+            
+            # 2. Recent cluster events 
+            try:
+                clusters = self.list_clusters()
+                
+                for cluster in clusters:
+                    cluster_id = cluster.get('cluster_id')
+                    if not cluster_id:
+                        continue
+                        
+                    # Check if events API is available
+                    events_available = hasattr(self._client.clusters, 'events')
+                    if events_available:
+                        # Get events for this cluster
+                        try:
+                            events = list(self._client.clusters.events(
+                                cluster_id=cluster_id,
+                                limit=min(20, limit),  # Limit per cluster
+                                order='DESC'
+                            ))
+                            
+                            # Add events to activity
+                            for event in events:
+                                event_dict = event.as_dict() if hasattr(event, 'as_dict') else event
+                                activity.append({
+                                    'type': 'cluster_event',
+                                    'id': f"{cluster_id}:{event_dict.get('timestamp', '')}",
+                                    'time': event_dict.get('timestamp'),
+                                    'status': event_dict.get('type'),
+                                    'details': {
+                                        'cluster_id': cluster_id,
+                                        'details': event_dict.get('details', {}),
+                                        'cluster_name': cluster.get('cluster_name')
+                                    }
+                                })
+                        except Exception as e:
+                            logger.warning(f"Error getting events for cluster {cluster_id}: {e}")
+                    else:
+                        # Just add basic cluster state as single "event"
+                        activity.append({
+                            'type': 'cluster_state',
+                            'id': cluster_id,
+                            'time': int(time.time() * 1000),  # Current time
+                            'status': cluster.get('state'),
+                            'details': {
+                                'cluster_id': cluster_id,
+                                'cluster_name': cluster.get('cluster_name'),
+                                'creator': cluster.get('creator_user_name')
+                            }
+                        })
+            except Exception as e:
+                logger.warning(f"Error getting cluster activity: {e}")
+            
+            # 3. Sort all activity by time (descending)
+            activity.sort(key=lambda x: x.get('time', 0), reverse=True)
+            
+            # 4. Limit to the requested number
+            if len(activity) > limit:
+                activity = activity[:limit]
+            
+            # Log duration and results
+            duration = time.time() - start_time
+            logger.info(f"Retrieved {len(activity)} activity records in {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                True, 
+                result_size=len(activity),
+                duration_seconds=duration
+            )
+            
+            return activity
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error getting activity: {e}", exc_info=True)
+            logger.error(f"Operation failed after {duration:.4f} seconds")
+            
+            self._log_api_call(
+                operation, 
+                params, 
+                False, 
+                error=e,
+                duration_seconds=duration
+            )
+            return [] 

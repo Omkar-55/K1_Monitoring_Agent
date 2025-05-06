@@ -12,7 +12,6 @@ import asyncio
 from typing import Dict, Any, List, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 from enum import Enum, auto
-from opentelemetry import trace
 
 # Import the Azure Agents SDK components
 try:
@@ -21,6 +20,7 @@ try:
     from azure.ai.agents.actions import Action, AzureMonitoringAction
     from azure.ai.agents.models import AgentResponse, ResponseValidation
     from azure.ai.agents.safety import SafetyPolicy, ContentFilterResults
+    from azure.ai.agents.guardrails import GuardrailFunctionOutput, InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered, RunContextWrapper, input_guardrail, output_guardrail
     AGENTS_SDK_AVAILABLE = True
 except ImportError:
     AGENTS_SDK_AVAILABLE = False
@@ -43,6 +43,22 @@ except ImportError:
         hate_content_score = 0.0
         sexual_content_score = 0.0
         self_harm_content_score = 0.0
+    
+    # Dummy guardrail classes
+    class GuardrailFunctionOutput:
+        def __init__(self, tripwire_triggered=False, output_info=None):
+            self.tripwire_triggered = tripwire_triggered
+            self.output_info = output_info
+    
+    class RunContextWrapper:
+        def __init__(self, context=None):
+            self.context = context
+    
+    def input_guardrail(func):
+        return func
+    
+    def output_guardrail(func):
+        return func
 
 # Import our agent core components
 from src.agent_core.logging_config import get_logger, setup_logging
@@ -57,18 +73,9 @@ from src.tools.databricks_monitoring import (
     final_report
 )
 
-# Enable tracing
-from src.agent_core import enable_tracing
-
-# Initialize tracing
-enable_tracing(service_name="databricks-monitoring-agent")
-
 # Set up logging
 setup_logging(log_level="info")
 logger = get_logger(__name__)
-
-# Get tracer for this module
-tracer = trace.get_tracer(__name__)
 
 class FixStatus(Enum):
     """Status of fix attempts."""
@@ -77,6 +84,18 @@ class FixStatus(Enum):
     SUCCESSFUL = auto()
     FAILED = auto()
     VERIFICATION_PENDING = auto()
+
+class InputValidationResult(BaseModel):
+    """Result of input validation."""
+    is_valid: bool
+    reason: Optional[str] = None
+    severity: float = 0.0
+
+class OutputValidationResult(BaseModel):
+    """Result of output validation."""
+    is_valid: bool
+    reason: Optional[str] = None
+    severity: float = 0.0
 
 class MonitoringRequest(BaseModel):
     """Model for Databricks monitoring request."""
@@ -131,6 +150,182 @@ class DatabricksMonitoringAgent:
         
         logger.info("Databricks Monitoring Agent initialized")
         
+    # Add input guardrail function
+    @input_guardrail
+    async def validate_input(
+        self,
+        ctx: RunContextWrapper, 
+        agent: Assistant, 
+        input: str
+    ) -> GuardrailFunctionOutput:
+        """
+        Input guardrail to validate that incoming requests are appropriate for this agent.
+        Prevents non-Databricks related queries and potential harmful content.
+        
+        Args:
+            ctx: The run context
+            agent: The assistant
+            input: The user input to validate
+            
+        Returns:
+            GuardrailFunctionOutput indicating whether the tripwire was triggered
+        """
+        logger.info(f"Validating input: {input}")
+        
+        # Skip validation if Agent SDK isn't available
+        if not AGENTS_SDK_AVAILABLE:
+            logger.warning("Skipping input validation: Azure Agents SDK not available")
+            return GuardrailFunctionOutput(
+                tripwire_triggered=False,
+                output_info=InputValidationResult(is_valid=True)
+            )
+        
+        # Check if input is empty or too short
+        if not input or len(input.strip()) < 5:
+            logger.warning("Input validation failed: Input too short")
+            return GuardrailFunctionOutput(
+                tripwire_triggered=True,
+                output_info=InputValidationResult(
+                    is_valid=False,
+                    reason="Input too short to process",
+                    severity=0.8
+                )
+            )
+        
+        # Check for non-Databricks related queries using the assistant
+        if self.assistant:
+            prompt = f"""
+            Is this query related to Databricks monitoring, diagnostics, or fixes?
+            Query: "{input}"
+            
+            Answer only 'yes' or 'no' and provide a brief reason.
+            """
+            
+            try:
+                response = await self.assistant.handle_message(prompt)
+                result = response.content.lower()
+                
+                if "no" in result[:5]:  # Check only beginning of response
+                    logger.warning(f"Input validation failed: Non-Databricks query detected: {result}")
+                    return GuardrailFunctionOutput(
+                        tripwire_triggered=True,
+                        output_info=InputValidationResult(
+                            is_valid=False,
+                            reason="This query is not related to Databricks monitoring",
+                            severity=0.9
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Error during input validation: {e}", exc_info=True)
+        
+        # Check for safety issues using the safety policy
+        if self.safety_policy:
+            try:
+                content_filter_results = self.safety_policy.evaluate(input)
+                
+                if content_filter_results.has_filtered_content:
+                    logger.warning("Input validation failed: Harmful content detected")
+                    return GuardrailFunctionOutput(
+                        tripwire_triggered=True,
+                        output_info=InputValidationResult(
+                            is_valid=False,
+                            reason="Potentially harmful content detected",
+                            severity=0.95
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Error during safety check: {e}", exc_info=True)
+        
+        logger.info("Input validation passed")
+        return GuardrailFunctionOutput(
+            tripwire_triggered=False,
+            output_info=InputValidationResult(is_valid=True)
+        )
+    
+    # Add output guardrail function
+    @output_guardrail
+    async def validate_output(
+        self,
+        ctx: RunContextWrapper, 
+        agent: Assistant, 
+        output: Any
+    ) -> GuardrailFunctionOutput:
+        """
+        Output guardrail to ensure responses are safe, relevant, and not hallucinations.
+        
+        Args:
+            ctx: The run context
+            agent: The assistant
+            output: The output to validate
+            
+        Returns:
+            GuardrailFunctionOutput indicating whether the tripwire was triggered
+        """
+        logger.info("Validating output")
+        output_content = getattr(output, "content", str(output))
+        
+        # Skip validation if Agent SDK isn't available
+        if not AGENTS_SDK_AVAILABLE:
+            logger.warning("Skipping output validation: Azure Agents SDK not available")
+            return GuardrailFunctionOutput(
+                tripwire_triggered=False,
+                output_info=OutputValidationResult(is_valid=True)
+            )
+        
+        # Check for safety issues using the safety policy
+        if self.safety_policy:
+            try:
+                content_filter_results = self.safety_policy.evaluate(output_content)
+                
+                if content_filter_results.has_filtered_content:
+                    logger.warning("Output validation failed: Harmful content detected")
+                    return GuardrailFunctionOutput(
+                        tripwire_triggered=True,
+                        output_info=OutputValidationResult(
+                            is_valid=False,
+                            reason="Potentially harmful content detected in output",
+                            severity=0.95
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Error during output safety check: {e}", exc_info=True)
+        
+        # Check for hallucinations using the OutOfDomainHandler
+        if self.out_of_domain_handler:
+            try:
+                validation = self.out_of_domain_handler.validate(output_content)
+                
+                if validation.is_out_of_domain:
+                    logger.warning(f"Output validation failed: Potential hallucination detected with score {validation.out_of_domain_score}")
+                    return GuardrailFunctionOutput(
+                        tripwire_triggered=True,
+                        output_info=OutputValidationResult(
+                            is_valid=False,
+                            reason=f"Potential hallucination detected: {validation.reason}",
+                            severity=validation.out_of_domain_score
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Error during hallucination check: {e}", exc_info=True)
+        
+        # Check if output is empty or too short
+        if not output_content or len(output_content.strip()) < 5:
+            logger.warning("Output validation failed: Output too short")
+            return GuardrailFunctionOutput(
+                tripwire_triggered=True,
+                output_info=OutputValidationResult(
+                    is_valid=False,
+                    reason="Output too short to be useful",
+                    severity=0.8
+                )
+            )
+        
+        logger.info("Output validation passed")
+        return GuardrailFunctionOutput(
+            tripwire_triggered=False,
+            output_info=OutputValidationResult(is_valid=True)
+        )
+        
     def _setup_assistant(self) -> Optional[Any]:
         """Set up the Azure AI Assistant for the agent."""
         if not AGENTS_SDK_AVAILABLE:
@@ -175,9 +370,12 @@ class DatabricksMonitoringAgent:
             system_message="""You are a Databricks monitoring agent that helps diagnose and fix issues in Databricks workspaces. 
             You will analyze logs, suggest fixes, implement them, and verify if they resolve the issues.
             Be thorough in your analysis, and explain your reasoning at each step.
-            Always verify that your suggestions are safe before applying them."""
+            Always verify that your suggestions are safe before applying them.""",
+            input_guardrails=[self.validate_input],
+            output_guardrails=[self.validate_output]
         )
         
+        logger.info("Assistant configured with input and output guardrails")
         return assistant
         
     async def process_request(self, request: MonitoringRequest) -> MonitoringResponse:
@@ -190,220 +388,240 @@ class DatabricksMonitoringAgent:
         Returns:
             The monitoring response with results
         """
-        with tracer.start_as_current_span("databricks_agent.process_request") as span:
-            span.set_attribute("job_id", request.job_id)
-            if request.run_id:
-                span.set_attribute("run_id", request.run_id)
+        logger.info(f"Processing monitoring request for job {request.job_id}")
+        
+        # Initialize the response
+        response = MonitoringResponse(
+            job_id=request.job_id,
+            run_id=request.run_id or "unknown",
+            issue_detected=False,
+            reasoning=[]
+        )
+        
+        try:
+            # Step 1: Get logs for the job
+            reasoning_step = {"step": "log_collection", "timestamp": time.time()}
             
-            logger.info(f"Processing monitoring request for job {request.job_id}")
+            if request.simulate:
+                from src.tools.databricks_monitoring.diagnostic_tools import simulate_run
+                logs_data = simulate_run(failure_type=request.simulate_failure_type or "memory_exceeded")
+                logger.info(f"Using simulated run data for failure type: {request.simulate_failure_type or 'memory_exceeded'}")
+            else:
+                logs_data = get_logs(request.job_id, request.run_id)
             
-            # Initialize the response
-            response = MonitoringResponse(
-                job_id=request.job_id,
-                run_id=request.run_id or "unknown",
-                issue_detected=False,
-                reasoning=[]
-            )
+            # Update response with run ID
+            response.run_id = logs_data.get("run_id", "unknown")
+            reasoning_step["result"] = f"Retrieved logs for run ID: {response.run_id}"
+            reasoning_step["logs_summary"] = self._summarize_logs(logs_data)
+            response.reasoning.append(reasoning_step)
+            
+            logger.info(f"Retrieved logs for run ID: {response.run_id}")
+        
+            # Step 2: Diagnose issues in the logs
+            reasoning_step = {"step": "diagnosis", "timestamp": time.time()}
             
             try:
-                # Step 1: Get logs for the job
-                with tracer.start_as_current_span("step1_get_logs"):
-                    reasoning_step = {"step": "log_collection", "timestamp": time.time()}
+                # If available, use the Azure Agents SDK for diagnosis with hallucination detection
+                if self.assistant and AGENTS_SDK_AVAILABLE:
+                    diagnosis, hallucination_info = await self._diagnose_with_assistant(logs_data)
+                    response.hallucination_detected = hallucination_info.get("detected", False)
                     
-                    if request.simulate:
-                        from src.tools.databricks_monitoring.diagnostic_tools import simulate_run
-                        logs_data = simulate_run(failure_type=request.simulate_failure_type or "memory_exceeded")
-                        logger.info(f"Using simulated run data for failure type: {request.simulate_failure_type or 'memory_exceeded'}")
-                    else:
-                        logs_data = get_logs(request.job_id, request.run_id)
+                    # Add hallucination info to reasoning
+                    reasoning_step["hallucination_check"] = hallucination_info
                     
-                    # Update response with run ID
-                    response.run_id = logs_data.get("run_id", "unknown")
-                    reasoning_step["result"] = f"Retrieved logs for run ID: {response.run_id}"
-                    reasoning_step["logs_summary"] = self._summarize_logs(logs_data)
-                    response.reasoning.append(reasoning_step)
-                    
-                    logger.info(f"Retrieved logs for run ID: {response.run_id}")
+                    # If hallucination detected, fallback to basic diagnosis
+                    if response.hallucination_detected:
+                        logger.warning(f"Hallucination detected in diagnosis with score {hallucination_info.get('score')}: {hallucination_info.get('reason')}")
+                        diagnosis = diagnose(logs_data)
+                else:
+                    # Fallback to basic diagnosis
+                    diagnosis = diagnose(logs_data)
+            except (InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered) as e:
+                logger.warning(f"Guardrail triggered during diagnosis: {e}")
+                diagnosis = diagnose(logs_data)
+                reasoning_step["guardrail_triggered"] = {
+                    "message": str(e),
+                    "step": "diagnosis"
+                }
+            
+            # Extract diagnosis results
+            response.issue_detected = True
+            response.issue_type = diagnosis.get("issue_type")
+            
+            reasoning_step["result"] = f"Diagnosed issue: {response.issue_type}"
+            reasoning_step["details"] = diagnosis.get("reasoning", "")
+            response.reasoning.append(reasoning_step)
+            
+            logger.info(f"Diagnosed issue: {response.issue_type}")
+        
+            # Step 3-5: Attempt fixes until success or max attempts reached
+            fix_status = FixStatus.NOT_STARTED
+            fix_attempts = 0
+            
+            while fix_status != FixStatus.SUCCESSFUL and fix_attempts < request.max_attempts:
+                fix_attempts += 1
                 
-                # Step 2: Diagnose the issue
-                with tracer.start_as_current_span("step2_diagnose"):
-                    reasoning_step = {"step": "diagnosis", "timestamp": time.time()}
-                    
-                    # If available, use the Azure Agents SDK for diagnosis with hallucination detection
+                # Step 3: Suggest a fix
+                reasoning_step = {"step": "fix_suggestion", "timestamp": time.time(), "attempt": fix_attempts}
+                
+                try:
+                    # If available, use the Azure Agents SDK for fix suggestion with safety checks
                     if self.assistant and AGENTS_SDK_AVAILABLE:
-                        diagnosis_result, hallucination_info = await self._diagnose_with_assistant(logs_data)
-                        issue_type = diagnosis_result.get("issue_type")
-                        reasoning = diagnosis_result.get("reasoning", "")
-                        response.hallucination_detected = hallucination_info.get("detected", False)
+                        fix_suggestion, safety_info = await self._suggest_fix_with_assistant(
+                            response.issue_type, 
+                            logs_data
+                        )
+                        fix_type = fix_suggestion.get("fix_type")
+                        fix_params = fix_suggestion.get("parameters", {})
+                        confidence = fix_suggestion.get("confidence", 0.0)
+                        response.safety_issues = safety_info.get("issues_detected", False)
                         
-                        reasoning_step["hallucination_check"] = hallucination_info
-                    else:
-                        # Use our built-in diagnostic tools
-                        diagnosis_result = diagnose(logs_data)
-                        issue_type = diagnosis_result.get("issue_type")
-                        reasoning = diagnosis_result.get("reasoning", "")
-                    
-                    if issue_type:
-                        response.issue_detected = True
-                        response.issue_type = issue_type
-                        reasoning_step["result"] = f"Diagnosed issue: {issue_type} - {reasoning}"
-                        logger.info(f"Diagnosed issue: {issue_type} - {reasoning}")
-                    else:
-                        reasoning_step["result"] = "No issues detected"
-                        logger.info("No issues detected in the Databricks run")
-                    
-                    response.reasoning.append(reasoning_step)
-                
-                # If no issue is detected, return early
-                if not response.issue_detected:
-                    response.report = "No issues detected in the Databricks job run."
-                    return response
-                
-                # Step 3-5: Attempt fixes until success or max attempts reached
-                fix_status = FixStatus.NOT_STARTED
-                fix_attempts = 0
-                
-                while fix_status != FixStatus.SUCCESSFUL and fix_attempts < request.max_attempts:
-                    fix_attempts += 1
-                    
-                    # Step 3: Suggest a fix
-                    with tracer.start_as_current_span(f"step3_suggest_fix_attempt_{fix_attempts}"):
-                        reasoning_step = {"step": "fix_suggestion", "timestamp": time.time(), "attempt": fix_attempts}
+                        reasoning_step["safety_check"] = safety_info
                         
-                        # If available, use the Azure Agents SDK for fix suggestion with safety checks
-                        if self.assistant and AGENTS_SDK_AVAILABLE:
-                            fix_suggestion, safety_info = await self._suggest_fix_with_assistant(
-                                response.issue_type, 
-                                logs_data
-                            )
-                            fix_type = fix_suggestion.get("fix_type")
-                            fix_params = fix_suggestion.get("parameters", {})
-                            confidence = fix_suggestion.get("confidence", 0.0)
-                            response.safety_issues = safety_info.get("issues_detected", False)
-                            
-                            reasoning_step["safety_check"] = safety_info
-                            
-                            # If safety issues detected, skip this fix
-                            if response.safety_issues:
-                                reasoning_step["result"] = f"Skipped unsafe fix: {fix_type}"
-                                logger.warning(f"Skipped potentially unsafe fix: {fix_type}")
-                                response.reasoning.append(reasoning_step)
-                                continue
-                        else:
-                            # Use our built-in fix suggestion tools
-                            fix_suggestion = suggest_fix(response.issue_type, logs_data)
-                            fix_type = fix_suggestion.get("fix_type")
-                            fix_params = fix_suggestion.get("parameters", {})
-                            confidence = fix_suggestion.get("confidence", 0.0)
-                        
-                        reasoning_step["result"] = f"Suggested fix: {fix_type} - {fix_suggestion.get('description', '')}"
-                        reasoning_step["confidence"] = confidence
-                        response.confidence = confidence
-                        response.reasoning.append(reasoning_step)
-                        
-                        logger.info(f"Suggested fix: {fix_type} - {fix_suggestion.get('description', '')}")
-                    
-                    # Step 4: Apply the fix
-                    with tracer.start_as_current_span(f"step4_apply_fix_attempt_{fix_attempts}"):
-                        reasoning_step = {"step": "fix_application", "timestamp": time.time(), "attempt": fix_attempts}
-                        
-                        # Apply the fix (or simulate it)
-                        if request.simulate:
-                            fix_result = {
-                                "success": True,
-                                "new_run_id": f"simulated-fixed-run-{int(time.time())}",
-                                "message": f"Simulated fix applied: {fix_type}"
-                            }
-                            logger.info(f"Simulated applying fix, new run ID: {fix_result['new_run_id']}")
-                        else:
-                            fix_result = apply_fix(
-                                job_id=request.job_id,
-                                run_id=response.run_id,
-                                fix_type=fix_type,
-                                parameters=fix_params
-                            )
-                        
-                        if fix_result.get("success", False):
-                            fix_status = FixStatus.VERIFICATION_PENDING
-                            reasoning_step["result"] = f"Fix applied: {fix_result.get('success')} - {fix_result.get('message', '')}"
-                            new_run_id = fix_result.get('new_run_id')
-                            reasoning_step["new_run_id"] = new_run_id
-                        else:
-                            fix_status = FixStatus.FAILED
-                            reasoning_step["result"] = f"Fix failed: {fix_result.get('message', 'Unknown error')}"
-                        
-                        response.reasoning.append(reasoning_step)
-                        logger.info(f"Fix applied: {fix_result.get('success')} - {fix_result.get('message', '')}")
-                    
-                    # Step 5: Verify the fix if it was applied
-                    if fix_status == FixStatus.VERIFICATION_PENDING:
-                        with tracer.start_as_current_span(f"step5_verify_fix_attempt_{fix_attempts}"):
-                            reasoning_step = {"step": "verification", "timestamp": time.time(), "attempt": fix_attempts}
-                            new_run_id = fix_result.get('new_run_id')
-                            
-                            # Verify the fix (or simulate it)
-                            if request.simulate:
-                                verification_result = {
-                                    "status": "success",
-                                    "details": "Simulated verification"
-                                }
-                                logger.info(f"Simulated verification result: {verification_result['status']}")
-                            else:
-                                verification_result = verify(
-                                    job_id=request.job_id,
-                                    run_id=new_run_id
-                                )
-                            
-                            if verification_result.get("status") == "success":
-                                fix_status = FixStatus.SUCCESSFUL
-                                reasoning_step["result"] = f"Verification result: {verification_result.get('status')}"
-                            else:
-                                fix_status = FixStatus.FAILED
-                                reasoning_step["result"] = f"Verification failed: {verification_result.get('details', 'Unknown error')}"
-                            
+                        # If safety issues detected, skip this fix
+                        if response.safety_issues:
+                            reasoning_step["result"] = f"Skipped unsafe fix: {fix_type}"
+                            logger.warning(f"Skipped potentially unsafe fix: {fix_type}")
                             response.reasoning.append(reasoning_step)
-                            logger.info(f"Verification result: {verification_result.get('status')}")
-                
-                # Update response with fix attempts and success status
-                response.fix_attempts = fix_attempts
-                response.fix_successful = (fix_status == FixStatus.SUCCESSFUL)
-                
-                # Step 6: Generate final report
-                with tracer.start_as_current_span("step6_generate_report"):
-                    report_data = {
-                        "job_id": request.job_id,
-                        "run_id": response.run_id,
-                        "issue_type": response.issue_type,
-                        "fix_attempts": response.fix_attempts,
-                        "fix_successful": response.fix_successful,
-                        "steps": response.reasoning
-                    }
-                    
-                    if AGENTS_SDK_AVAILABLE and self.assistant:
-                        report_text = await self._generate_report_with_assistant(report_data)
+                            continue
                     else:
-                        report_text = final_report(report_data)
+                        # Fallback to built-in fix suggestion
+                        fix_suggestion = suggest_fix(response.issue_type, logs_data)
+                        fix_type = fix_suggestion.get("fix_type")
+                        fix_params = fix_suggestion.get("parameters", {})
+                        confidence = fix_suggestion.get("confidence", 0.0)
+                except (InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered) as e:
+                    logger.warning(f"Guardrail triggered during fix suggestion: {e}")
+                    fix_suggestion = suggest_fix(response.issue_type, logs_data)
+                    fix_type = fix_suggestion.get("fix_type")
+                    fix_params = fix_suggestion.get("parameters", {})
+                    confidence = fix_suggestion.get("confidence", 0.0)
+                    reasoning_step["guardrail_triggered"] = {
+                        "message": str(e),
+                        "step": "fix_suggestion"
+                    }
+                
+                response.confidence = confidence
+                reasoning_step["result"] = f"Suggested fix: {fix_type} (confidence: {confidence})"
+                reasoning_step["parameters"] = fix_params
+                response.reasoning.append(reasoning_step)
+                
+                logger.info(f"Suggested fix: {fix_type} (confidence: {confidence})")
+            
+                # Step 4: Apply the fix
+                reasoning_step = {"step": "fix_application", "timestamp": time.time(), "attempt": fix_attempts}
+                
+                # Apply the fix (or simulate if requested)
+                try:
+                    fix_result = apply_fix(
+                        request.job_id, 
+                        response.run_id, 
+                        fix_type, 
+                        fix_params,
+                        simulate=request.simulate
+                    )
                     
-                    response.report = report_text
-                    logger.info("Final report generated")
+                    reasoning_step["result"] = fix_result.get("message", "Fix applied")
+                    reasoning_step["details"] = fix_result.get("details", {})
+                    response.reasoning.append(reasoning_step)
+                    
+                    logger.info(f"Applied fix: {fix_type}")
+                except Exception as e:
+                    logger.error(f"Error applying fix: {e}", exc_info=True)
+                    reasoning_step["result"] = f"Error applying fix: {str(e)}"
+                    response.reasoning.append(reasoning_step)
+                    continue
+            
+                # Step 5: Verify the fix
+                reasoning_step = {"step": "fix_verification", "timestamp": time.time(), "attempt": fix_attempts}
                 
-                return response
-                
-            except Exception as e:
-                logger.error(f"Error processing monitoring request: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                
-                # Add error to reasoning
+                # Verify the fix
+                try:
+                    verification_result = verify(request.job_id, response.run_id, simulate=request.simulate)
+                    
+                    fix_status = FixStatus[verification_result.get("status", "FAILED").upper()]
+                    
+                    reasoning_step["result"] = verification_result.get("message", "Fix verification completed")
+                    reasoning_step["details"] = verification_result.get("details", {})
+                    reasoning_step["status"] = fix_status.name
+                    response.reasoning.append(reasoning_step)
+                    
+                    if fix_status == FixStatus.SUCCESSFUL:
+                        logger.info(f"Fix successful on attempt {fix_attempts}")
+                        response.fix_successful = True
+                    else:
+                        logger.warning(f"Fix verification failed on attempt {fix_attempts}: {verification_result.get('message')}")
+                        fix_status = FixStatus.FAILED
+                except Exception as e:
+                    logger.error(f"Error verifying fix: {e}", exc_info=True)
+                    reasoning_step["result"] = f"Error verifying fix: {str(e)}"
+                    reasoning_step["status"] = FixStatus.FAILED.name
+                    response.reasoning.append(reasoning_step)
+                    fix_status = FixStatus.FAILED
+            
+            # Record the number of fix attempts
+            response.fix_attempts = fix_attempts
+            
+            # Generate final report
+            try:
+                if self.assistant and AGENTS_SDK_AVAILABLE:
+                    report, hallucination_info = await self._generate_report_with_assistant(
+                        response.issue_type,
+                        response.reasoning,
+                        response.fix_successful
+                    )
+                    
+                    # If hallucination detected, fallback to basic report
+                    if hallucination_info.get("detected", False):
+                        logger.warning(f"Hallucination detected in report with score {hallucination_info.get('score')}: {hallucination_info.get('reason')}")
+                        response.hallucination_detected = True
+                        response.report = final_report(
+                            response.issue_type,
+                            response.reasoning,
+                            response.fix_successful
+                        )
+                    else:
+                        response.report = report
+                else:
+                    response.report = final_report(
+                        response.issue_type,
+                        response.reasoning,
+                        response.fix_successful
+                    )
+            except (InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered) as e:
+                logger.warning(f"Guardrail triggered during report generation: {e}")
+                response.report = final_report(
+                    response.issue_type,
+                    response.reasoning,
+                    response.fix_successful
+                )
+                # Add guardrail info to the response
                 response.reasoning.append({
-                    "step": "error",
+                    "step": "report_generation",
                     "timestamp": time.time(),
-                    "error": str(e)
+                    "guardrail_triggered": {
+                        "message": str(e),
+                        "step": "report_generation"
+                    },
+                    "result": "Used fallback report generation due to guardrail trigger"
                 })
-                
-                # Add error report
-                response.report = f"Error during monitoring: {str(e)}"
-                return response
+            
+            logger.info("Generated final report")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error processing request: {e}", exc_info=True)
+            
+            # Update response with error details
+            error_step = {
+                "step": "error",
+                "timestamp": time.time(),
+                "result": f"Error: {str(e)}"
+            }
+            response.reasoning.append(error_step)
+            
+            return response
     
     async def _diagnose_with_assistant(self, logs_data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
@@ -535,22 +753,34 @@ class DatabricksMonitoringAgent:
         
         return fix_suggestion, safety_info
     
-    async def _generate_report_with_assistant(self, report_data: Dict[str, Any]) -> str:
+    async def _generate_report_with_assistant(self, issue_type: str, reasoning: List[Dict[str, Any]], fix_successful: bool) -> Tuple[str, Dict[str, Any]]:
         """
         Use the Azure Agents SDK to generate a final report.
         
         Args:
-            report_data: The report data
+            issue_type: The type of issue detected
+            reasoning: The reasoning steps taken
+            fix_successful: Whether the fix was successful
             
         Returns:
-            The formatted report text
+            A tuple of (report_text, hallucination_info)
         """
         if not AGENTS_SDK_AVAILABLE or not self.assistant:
             logger.warning("Cannot use AI assistant for report generation: Azure Agents SDK not available")
             # Fall back to built-in report generation
-            return final_report(report_data)
+            report_text = final_report(issue_type, reasoning, fix_successful)
+            hallucination_info = {
+                "detected": False,
+                "score": 0.0,
+                "reason": "Report generation unavailable (Azure Agents SDK not installed)"
+            }
+            return report_text, hallucination_info
             
-        report_text = json.dumps(report_data, indent=2)
+        report_text = json.dumps({
+            "issue_type": issue_type,
+            "reasoning": reasoning,
+            "fix_successful": fix_successful
+        }, indent=2)
         
         prompt = f"""
         Generate a comprehensive final report for this Databricks monitoring session:
@@ -569,7 +799,15 @@ class DatabricksMonitoringAgent:
         # Get response from the assistant
         agent_response: AgentResponse = await self.assistant.handle_message(prompt)
         
-        return agent_response.content
+        # Check for hallucinations
+        validation: ResponseValidation = self.out_of_domain_handler.validate(agent_response.content)
+        hallucination_info = {
+            "detected": validation.is_out_of_domain,
+            "score": validation.out_of_domain_score,
+            "reason": validation.reason if validation.is_out_of_domain else None
+        }
+        
+        return agent_response.content, hallucination_info
     
     def _summarize_logs(self, logs_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a summary of the logs data."""
@@ -698,15 +936,15 @@ class DatabricksMonitoringAgent:
             logger.error(f"Error in verify action: {e}", exc_info=True)
             return json.dumps({"error": str(e)})
     
-    async def _generate_report_wrapper(self, report_data_json: str) -> str:
+    async def _generate_report_wrapper(self, issue_type: str, reasoning_json: str, fix_successful: bool) -> str:
         """Wrapper for generate_report action."""
         try:
-            report_data = json.loads(report_data_json)
-            result = final_report(report_data)
+            reasoning = json.loads(reasoning_json)
+            result = final_report(issue_type, reasoning, fix_successful)
             return result
         except Exception as e:
             logger.error(f"Error in generate_report action: {e}", exc_info=True)
-            return f"Error generating report: {str(e)}"
+            return json.dumps({"error": str(e)})
 
 # Utility function for easy access
 async def monitor_databricks_job(

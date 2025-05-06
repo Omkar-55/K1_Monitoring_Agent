@@ -48,8 +48,9 @@ def setup_logging(
     log_to_console: bool = True,
     log_file_name: str = "agent.log",
     log_file_max_size: int = 10 * 1024 * 1024,  # 10 MB
-    log_file_backup_count: int = 5
-) -> None:
+    log_file_backup_count: int = 5,
+    log_file: str = None
+) -> bool:
     """
     Configure logging with both file and console handlers.
     
@@ -61,46 +62,63 @@ def setup_logging(
         log_file_name: The name of the log file
         log_file_max_size: Maximum size of the log file before rotation
         log_file_backup_count: Number of backup log files to keep
+        log_file: Optional full path to log file (takes precedence over log_file_name)
+        
+    Returns:
+        bool: True if logging was successfully configured, False otherwise
     """
-    # Convert log level string to logging level
-    level = LOG_LEVELS.get(log_level.lower(), logging.INFO)
-    
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
-    
-    # Remove existing handlers to avoid duplicates
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Create formatter
-    formatter = logging.Formatter(log_format, date_format)
-    
-    # Create logs directory if it doesn't exist
-    project_root = get_project_root()
-    logs_dir = project_root / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
-    
-    # Configure file handler for logging to file
-    log_file_path = logs_dir / log_file_name
-    file_handler = RotatingFileHandler(
-        filename=log_file_path,
-        maxBytes=log_file_max_size,
-        backupCount=log_file_backup_count
-    )
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-    
-    # Configure console handler for logging to stdout
-    if log_to_console:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
-        root_logger.addHandler(console_handler)
-    
-    # Log that the logging system has been initialized
-    logging.info(f"Logging initialized. Log file: {log_file_path}")
+    try:
+        # Convert log level string to logging level
+        level = LOG_LEVELS.get(log_level.lower(), logging.INFO)
+        
+        # Configure root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+        
+        # Remove existing handlers to avoid duplicates
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        
+        # Create formatter
+        formatter = logging.Formatter(log_format, date_format)
+        
+        # Determine log file path
+        if log_file:
+            # Use the full path provided
+            log_file_path = Path(log_file)
+            # Make sure the directory exists
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        else:
+            # Create logs directory if it doesn't exist
+            project_root = get_project_root()
+            logs_dir = project_root / "logs"
+            os.makedirs(logs_dir, exist_ok=True)
+            log_file_path = logs_dir / log_file_name
+        
+        # Configure file handler for logging to file
+        file_handler = RotatingFileHandler(
+            filename=log_file_path,
+            maxBytes=log_file_max_size,
+            backupCount=log_file_backup_count
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        
+        # Configure console handler for logging to stdout
+        if log_to_console:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(level)
+            console_handler.setFormatter(formatter)
+            root_logger.addHandler(console_handler)
+        
+        # Log that the logging system has been initialized
+        logging.info(f"Logging initialized. Log file: {log_file_path}")
+        
+        return True
+    except Exception as e:
+        print(f"Error setting up logging: {e}")
+        return False
 
 # Default logger for this module
 logger = logging.getLogger(__name__)

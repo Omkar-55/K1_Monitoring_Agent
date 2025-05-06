@@ -3,18 +3,32 @@ OpenAI Agents integration for the K1 Monitoring Agent.
 """
 
 import os
+import time
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
-from opentelemetry import trace
 
 # Import OpenAI Agents
 try:
     import openai
     from openai import OpenAI
     from openai_agents import AgentMessage, MessageRole, Tool, AgentState, AssistantId, Thread
-    AGENTS_SDK_AVAILABLE = True
+    # Try to import Azure Agents SDK components
+    try:
+        from azure.ai.agents.guardrails import RunContextWrapper
+        AGENTS_SDK_AVAILABLE = True
+    except ImportError:
+        # Still consider it available even if just basic OpenAI agents work
+        AGENTS_SDK_AVAILABLE = True
+        # Define a minimal RunContextWrapper
+        class RunContextWrapper:
+            def __init__(self, context=None):
+                self.context = context
 except ImportError:
     AGENTS_SDK_AVAILABLE = False
+    # Define a minimal RunContextWrapper for compatibility when SDK not available
+    class RunContextWrapper:
+        def __init__(self, context=None):
+            self.context = context
 
 # Import our existing components
 from .logging_config import get_logger
@@ -22,9 +36,6 @@ from .core_logic import Agent, AgentInput, AgentResponse
 
 # Initialize logger
 logger = get_logger(__name__)
-
-# Get tracer for this module
-tracer = trace.get_tracer(__name__)
 
 class AgentsSdkRequest(BaseModel):
     """Model for an Agents request."""
@@ -72,72 +83,72 @@ class AgentsSdkAdapter:
         Returns:
             A response formatted for the OpenAI Agents ecosystem
         """
-        with tracer.start_as_current_span("agents.process_request") as span:
-            span.set_attribute("request_type", "openai_agents")
-            
-            if not AGENTS_SDK_AVAILABLE:
-                logger.error("Cannot process Agents request: OpenAI Agents not available")
-                return {
-                    "type": "error",
-                    "error": {
-                        "message": "OpenAI Agents is not installed"
-                    }
+        logger.info("Processing Agents SDK request")
+        start_time = time.time()
+        
+        if not AGENTS_SDK_AVAILABLE:
+            logger.error("Cannot process Agents request: OpenAI Agents not available")
+            return {
+                "type": "error",
+                "error": {
+                    "message": "OpenAI Agents is not installed"
                 }
+            }
+        
+        logger.info("Processing request attributes")
+        
+        try:
+            # Extract the latest user message
+            last_user_message = None
+            for message in reversed(request.messages):
+                if message.get("role") == "user":
+                    last_user_message = message.get("content", "")
+                    break
             
-            logger.info("Processing Agents request")
+            if not last_user_message:
+                logger.warning("No user message found in the conversation")
+                last_user_message = "Hello"
             
-            try:
-                # Extract the latest user message
-                last_user_message = None
-                for message in reversed(request.messages):
-                    if message.get("role") == "user":
-                        last_user_message = message.get("content", "")
-                        break
-                
-                if not last_user_message:
-                    logger.warning("No user message found in the conversation")
-                    last_user_message = "Hello"
-                
-                # Convert to our internal format
-                agent_input = AgentInput(
-                    query=last_user_message,
-                    context=request.metadata,
-                    conversation_id=request.metadata.get("conversation_id")
-                )
-                
-                # Process with our agent
-                agent_response = await self.agent.process_query(agent_input)
-                
-                # Format the response in a way compatible with OpenAI Agents
-                response = {
-                    "type": "agent_response",
-                    "messages": [
-                        {
-                            "role": "assistant",
-                            "content": agent_response.response
-                        }
-                    ],
-                    "metadata": {
-                        "confidence": agent_response.confidence,
-                        "sources": agent_response.sources
+            # Convert to our internal format
+            agent_input = AgentInput(
+                query=last_user_message,
+                context=request.metadata,
+                conversation_id=request.metadata.get("conversation_id")
+            )
+            
+            # Process with our agent
+            agent_response = await self.agent.process_query(agent_input)
+            
+            # Format the response in a way compatible with OpenAI Agents
+            response = {
+                "type": "agent_response",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": agent_response.response
                     }
+                ],
+                "metadata": {
+                    "confidence": agent_response.confidence,
+                    "sources": agent_response.sources,
+                    "processing_time": time.time() - start_time
                 }
-                
-                logger.info(f"Agent response created with confidence: {agent_response.confidence}")
-                return response
-                
-            except Exception as e:
-                logger.error(f"Error processing Agents request: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                
-                # Return error response
-                return {
-                    "type": "error",
-                    "error": {
-                        "message": str(e)
-                    }
+            }
+            
+            logger.info(f"Agent response created with confidence: {agent_response.confidence}, took {time.time() - start_time:.2f}s")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error processing Agents request: {e}", exc_info=True)
+            logger.error(f"Request processing failed after {time.time() - start_time:.2f}s")
+            
+            # Return error response
+            return {
+                "type": "error",
+                "error": {
+                    "message": str(e)
                 }
+            }
     
     def is_available(self) -> bool:
         """Check if OpenAI Agents is available."""
@@ -159,6 +170,9 @@ class AgentsSdkAdapter:
             return {"error": "OpenAI client not available"}
         
         try:
+            logger.info(f"Creating thread response for thread {thread_id}")
+            start_time = time.time()
+            
             # Add a message to the thread
             message = self.client.beta.threads.messages.create(
                 thread_id=thread_id,
@@ -175,7 +189,6 @@ class AgentsSdkAdapter:
             # Wait for the run to complete
             while run.status in ["queued", "in_progress"]:
                 # Sleep a bit to avoid polling too frequently
-                import time
                 time.sleep(1)
                 
                 # Retrieve the updated run
@@ -192,6 +205,9 @@ class AgentsSdkAdapter:
                 )
                 
                 # Format the response
+                response_time = time.time() - start_time
+                logger.info(f"Thread response created in {response_time:.2f} seconds")
+                
                 return {
                     "type": "agent_response",
                     "messages": [
@@ -202,10 +218,12 @@ class AgentsSdkAdapter:
                     ],
                     "metadata": {
                         "thread_id": thread_id,
-                        "run_id": run.id
+                        "run_id": run.id,
+                        "processing_time": response_time
                     }
                 }
             else:
+                logger.error(f"Run failed with status: {run.status}")
                 return {
                     "type": "error",
                     "error": {

@@ -1,191 +1,148 @@
 """
-Diagnostic tools for analyzing Databricks job failures.
+Tools for diagnosing issues in Databricks logs.
 """
 
-import enum
-from typing import Dict, Any, Tuple, Optional, List
-import json
-import re
+import random
 import time
-from opentelemetry import trace
+from enum import Enum
+from typing import Dict, Any, List, Optional
 
 # Import the logging configuration
-from agent_core.logging_config import get_logger
+from src.agent_core.logging_config import get_logger
 
 # Get logger for this module
 logger = get_logger(__name__)
 
-# Get tracer for this module
-tracer = trace.get_tracer(__name__)
-
-
-class FailureType(enum.Enum):
-    """Enumeration of failure types for Databricks jobs."""
-    
-    # Resource-related issues
+class FailureType(str, Enum):
+    """Types of failures that can be diagnosed."""
     MEMORY_EXCEEDED = "memory_exceeded"
     DISK_SPACE_EXCEEDED = "disk_space_exceeded"
-    DRIVER_FAILURE = "driver_failure"
-    EXECUTOR_FAILURE = "executor_failure"
-    CLUSTER_RESOURCE_EXHAUSTION = "cluster_resource_exhaustion"
-    
-    # Data-related issues
-    DATA_VALIDATION_ERROR = "data_validation_error"
-    SCHEMA_MISMATCH = "schema_mismatch"
-    DATA_CORRUPTION = "data_corruption"
-    DATA_NOT_FOUND = "data_not_found"
-    
-    # Code-related issues
-    SYNTAX_ERROR = "syntax_error"
     DEPENDENCY_ERROR = "dependency_error"
-    IMPORT_ERROR = "import_error"
-    FUNCTION_ERROR = "function_error"
-    TYPE_ERROR = "type_error"
-    PERMISSION_ERROR = "permission_error"
-    TIMEOUT = "timeout"
-    
-    # Configuration issues
-    CONFIG_ERROR = "config_error"
-    CONNECTION_ERROR = "connection_error"
-    AUTH_ERROR = "auth_error"
-    QUOTA_EXCEEDED = "quota_exceeded"
-    
-    # Unspecified or unknown
     UNKNOWN = "unknown"
 
-@tracer.start_as_current_span("diagnose")
 def diagnose(logs_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Diagnose the type of failure based on log content.
+    Diagnose issues in Databricks logs.
     
     Args:
-        logs_data: Dictionary containing logs and metadata
+        logs_data: The logs data to analyze
         
     Returns:
-        Dictionary with diagnosis information including issue_type and reasoning
+        A diagnosis result with issue_type and reasoning
     """
-    logger.info("Diagnosing Databricks job failure from logs")
+    logger.info("Diagnosing Databricks logs")
     
-    # Extract the logs content
-    stdout = logs_data.get("logs", {}).get("stdout", "")
-    stderr = logs_data.get("logs", {}).get("stderr", "")
+    # Extract the logs
+    logs = logs_data.get("logs", {})
+    stdout = logs.get("stdout", "")
+    stderr = logs.get("stderr", "")
     
-    # Combine stdout and stderr for analysis
-    log_text = f"{stdout}\n{stderr}"
-    
-    # Check for memory-related issues
-    memory_patterns = [
-        r"OutOfMemoryError",
-        r"GC overhead limit exceeded",
-        r"java heap space",
-        r"Memory limit exceeded",
-        r"not enough memory"
-    ]
-    
-    for pattern in memory_patterns:
-        if re.search(pattern, log_text, re.IGNORECASE):
-            issue_type = FailureType.MEMORY_EXCEEDED.value
-            reason = f"Found memory error pattern: {pattern}"
-            logger.info(f"Diagnosed: {issue_type} - {reason}")
-            return {"issue_type": issue_type, "reasoning": reason}
+    # Check for memory issues
+    if "java.lang.OutOfMemoryError" in stderr or "MemoryError" in stderr:
+        issue_type = FailureType.MEMORY_EXCEEDED
+        reasoning = "Job failed due to insufficient memory. Found OutOfMemoryError in logs."
     
     # Check for disk space issues
-    disk_patterns = [
-        r"No space left on device",
-        r"Disk quota exceeded",
-        r"cannot create temp file",
-        r"disk full",
-        r"disk space"
-    ]
+    elif "No space left on device" in stderr or "Disk quota exceeded" in stderr:
+        issue_type = FailureType.DISK_SPACE_EXCEEDED
+        reasoning = "Job failed due to insufficient disk space. Found disk space error in logs."
     
-    for pattern in disk_patterns:
-        if re.search(pattern, log_text, re.IGNORECASE):
-            issue_type = FailureType.DISK_SPACE_EXCEEDED.value
-            reason = f"Found disk space error pattern: {pattern}"
-            logger.info(f"Diagnosed: {issue_type} - {reason}")
-            return {"issue_type": issue_type, "reasoning": reason}
+    # Check for dependency issues
+    elif "ModuleNotFoundError" in stderr or "ImportError" in stderr or "ClassNotFoundException" in stderr:
+        issue_type = FailureType.DEPENDENCY_ERROR
+        reasoning = "Job failed due to missing dependencies. Found import or module errors in logs."
     
-    # Check for dependency/import errors
-    dependency_patterns = [
-        r"ClassNotFoundException",
-        r"NoClassDefFoundError",
-        r"ModuleNotFoundError",
-        r"ImportError",
-        r"Could not resolve dependencies",
-        r"Dependency .* not found",
-        r"No module named"
-    ]
+    # Unknown issue
+    else:
+        issue_type = FailureType.UNKNOWN
+        reasoning = "Could not identify a specific issue type from the logs."
     
-    for pattern in dependency_patterns:
-        if re.search(pattern, log_text, re.IGNORECASE):
-            issue_type = FailureType.DEPENDENCY_ERROR.value
-            reason = f"Found dependency error pattern: {pattern}"
-            logger.info(f"Diagnosed: {issue_type} - {reason}")
-            return {"issue_type": issue_type, "reasoning": reason}
+    logger.info(f"Diagnosed issue: {issue_type}")
     
-    # Default to unknown issue type if no patterns matched
-    issue_type = FailureType.UNKNOWN.value
-    reason = "Unable to determine specific error type"
-    logger.warning(f"Diagnosed: {issue_type} - {reason}")
-    return {"issue_type": issue_type, "reasoning": reason}
+    return {
+        "issue_type": issue_type,
+        "reasoning": reasoning,
+        "logs_analyzed": {
+            "stdout_length": len(stdout),
+            "stderr_length": len(stderr)
+        }
+    }
 
-def simulate_run(failure_type: str = "memory_exceeded") -> Dict[str, Any]:
+def simulate_run(failure_type: Optional[str] = None) -> Dict[str, Any]:
     """
-    Simulate a Databricks run with a specific failure type for testing.
+    Generate simulated logs for testing.
     
     Args:
         failure_type: The type of failure to simulate
         
     Returns:
-        A dictionary containing simulated run data
+        Simulated logs data
     """
-    # Generate appropriate stderr logs based on failure type
-    stderr_logs = ""
+    logger.info(f"Simulating run with failure type: {failure_type}")
     
-    if failure_type == "memory_exceeded":
-        stderr_logs = """
-        [DRIVER] ExecutorLostFailure: Job aborted due to stage failure:
-        Task 12 in stage 4.0 failed 4 times, most recent failure: Lost task 12.3
-        java.lang.OutOfMemoryError: Java heap space
-        at java.util.Arrays.copyOf(Arrays.java:3181)
-        at java.util.ArrayList.grow(ArrayList.java:265)
-        """
-    elif failure_type == "disk_space_exceeded":
-        stderr_logs = """
-        [EXECUTOR] ERROR: No space left on device: /tmp/blockmgr-12324-34232-353a
-        java.io.IOException: No space left on device
-        at java.io.FileOutputStream.writeBytes(Native Method)
-        """
-    elif failure_type == "dependency_error":
-        stderr_logs = """
-        [DRIVER] Py4JJavaError: An error occurred while calling z:org.apache.spark.sql.functions.col.
-
-        : java.lang.ClassNotFoundException: org.apache.spark.sql.functions
-
-        ModuleNotFoundError: No module named 'matplotlib'
-        """
+    # Generate a random run ID
+    run_id = f"run_{random.randint(10000, 99999)}"
+    job_id = f"job_{random.randint(1000, 9999)}"
+    
+    # Default to a random failure type if none specified
+    if not failure_type:
+        failure_types = list(FailureType)
+        failure_type = random.choice(failure_types)
+    
+    # Ensure failure_type is a string
+    if isinstance(failure_type, FailureType):
+        failure_type = failure_type.value
+    
+    # Generate appropriate logs for the failure type
+    stdout = "Starting Databricks job execution...\n"
+    stdout += "Loading data...\n"
+    stdout += "Processing data...\n"
+    
+    stderr = ""
+    
+    if failure_type == FailureType.MEMORY_EXCEEDED:
+        stdout += "Processing large dataset...\n"
+        stderr += "WARNING: Memory usage is high\n"
+        stderr += "ERROR: java.lang.OutOfMemoryError: Java heap space\n"
+        stderr += "  at org.apache.spark.sql.execution.aggregate.HashAggregateExec.doExecute(HashAggregateExec.scala:115)\n"
+        stderr += "  at org.apache.spark.sql.execution.SparkPlan.execute(SparkPlan.scala:180)\n"
+    
+    elif failure_type == FailureType.DISK_SPACE_EXCEEDED:
+        stdout += "Writing results to disk...\n"
+        stderr += "WARNING: Disk usage is high\n"
+        stderr += "ERROR: java.io.IOException: No space left on device\n"
+        stderr += "  at java.io.FileOutputStream.writeBytes(Native Method)\n"
+        stderr += "  at java.io.FileOutputStream.write(FileOutputStream.java:326)\n"
+    
+    elif failure_type == FailureType.DEPENDENCY_ERROR:
+        stdout += "Importing libraries...\n"
+        stderr += "ERROR: ModuleNotFoundError: No module named 'pandas'\n"
+        stderr += "  at <frozen importlib._bootstrap>(219)._call_with_frames_removed\n"
+        stderr += "  at <frozen importlib._bootstrap_external>(728).exec_module\n"
+    
     else:
-        stderr_logs = f"Unknown error type: {failure_type}"
+        stdout += "Executing job...\n"
+        stderr += "ERROR: Unknown error occurred\n"
+        stderr += "  at com.databricks.backend.common.rpc.InternalDriverConnectionProvider.lambda$getOrCreate$1(InternalDriverConnectionProvider.scala:102)\n"
     
-    # Create a simulated run
-    return {
-        "run_id": f"simulated-run-{int(time.time())}",
-        "job_id": "12345",
-        "status": "TERMINATED", 
-        "result": "FAILED",
-        "start_time": int(time.time() * 1000) - 3600000,  # 1 hour ago
-        "end_time": int(time.time() * 1000) - 3540000,  # 59 minutes ago
-        "duration_seconds": 60,
-        "run_name": "Test Job Run",
+    # Simulate job status
+    status = "FAILED"
+    
+    # Simulate run duration
+    duration_seconds = random.randint(60, 3600)
+    
+    # Return the simulated logs
+    logs_data = {
+        "run_id": run_id,
+        "job_id": job_id,
+        "status": status,
+        "duration_seconds": duration_seconds,
         "logs": {
-            "stdout": "Starting job execution...\nProcessing data...\n",
-            "stderr": stderr_logs
-        },
-        "metadata": {
-            "cluster_id": "0123-456789-abcdef",
-            "creator": "test-user",
-            "cluster_size": "small",
-            "driver_memory": "4g",
-            "executor_memory": "4g"
+            "stdout": stdout,
+            "stderr": stderr
         }
-    } 
+    }
+    
+    logger.info(f"Simulated run {run_id} with failure type {failure_type}")
+    
+    return logs_data 

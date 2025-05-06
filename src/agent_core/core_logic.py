@@ -3,19 +3,16 @@ Core logic for the K1 Monitoring Agent.
 """
 
 import os
+import time
 import asyncio
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field, validator
-from opentelemetry import trace
 
 # Import our logging configuration
 from .logging_config import get_logger
 
 # Initialize logger
 logger = get_logger(__name__)
-
-# Get tracer for this module
-tracer = trace.get_tracer(__name__)
 
 class AgentInput(BaseModel):
     """Input data model for the agent."""
@@ -95,69 +92,73 @@ class Agent:
         Returns:
             The agent's response
         """
-        with tracer.start_as_current_span("agent.process_query") as span:
-            span.set_attribute("query", input_data.query)
-            if input_data.conversation_id:
-                span.set_attribute("conversation_id", input_data.conversation_id)
+        logger.info(f"Processing query: {input_data.query}")
+        start_time = time.time()
+        
+        if input_data.conversation_id:
+            logger.info(f"Conversation ID: {input_data.conversation_id}")
+        
+        if not self.client:
+            logger.warning("Using mock response (Azure OpenAI client not available)")
+            return AgentResponse(
+                response="I'm sorry, but I'm not fully initialized yet.",
+                confidence=0.5,
+                sources=[]
+            )
+        
+        try:
+            # Prepare the messages for the chat completion
+            messages = [
+                {"role": "system", "content": "You are the K1 Monitoring Agent, designed to help with monitoring tasks."},
+                {"role": "user", "content": input_data.query}
+            ]
             
-            logger.info(f"Processing query: {input_data.query}")
+            # Add context if available
+            if input_data.context:
+                context_str = str(input_data.context)
+                messages.insert(1, {"role": "system", "content": f"Context: {context_str}"})
             
-            if not self.client:
-                logger.warning("Using mock response (Azure OpenAI client not available)")
-                return AgentResponse(
-                    response="I'm sorry, but I'm not fully initialized yet.",
-                    confidence=0.5,
-                    sources=[]
-                )
+            # Log API call start
+            logger.info(f"Calling Azure OpenAI API with deployment: {self.deployment_name}")
+            api_start_time = time.time()
             
-            try:
-                # Prepare the messages for the chat completion
-                messages = [
-                    {"role": "system", "content": "You are the K1 Monitoring Agent, designed to help with monitoring tasks."},
-                    {"role": "user", "content": input_data.query}
-                ]
-                
-                # Add context if available
-                if input_data.context:
-                    context_str = str(input_data.context)
-                    messages.insert(1, {"role": "system", "content": f"Context: {context_str}"})
-                
-                # Create a span for the API call
-                with tracer.start_as_current_span("azure_openai.chat.completions") as api_span:
-                    api_span.set_attribute("deployment_name", self.deployment_name)
-                    
-                    # Make the API call
-                    response = await self.client.chat.completions.create(
-                        deployment_name=self.deployment_name,
-                        messages=messages,
-                        temperature=0.7,
-                        max_tokens=800
-                    )
-                
-                # Extract the response
-                response_text = response.choices[0].message.content
-                
-                # Create the agent response
-                agent_response = AgentResponse(
-                    response=response_text,
-                    confidence=0.85,  # For a real agent, this would be dynamically calculated
-                    sources=[]  # In a real agent, this would include sources
-                )
-                
-                logger.info(f"Generated response with {len(response_text)} characters")
-                return agent_response
-                
-            except Exception as e:
-                logger.error(f"Error processing query: {e}", exc_info=True)
-                span.record_exception(e)
-                span.set_status(trace.Status(trace.StatusCode.ERROR))
-                
-                # Return a fallback response
-                return AgentResponse(
-                    response="I'm sorry, but I encountered an error processing your request.",
-                    confidence=0.0,
-                    sources=[]
-                )
+            # Make the API call
+            response = await self.client.chat.completions.create(
+                deployment_name=self.deployment_name,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=800
+            )
+            
+            # Log API call duration
+            api_duration = time.time() - api_start_time
+            logger.info(f"Azure OpenAI API call completed in {api_duration:.2f} seconds")
+            
+            # Extract the response
+            response_text = response.choices[0].message.content
+            
+            # Create the agent response
+            agent_response = AgentResponse(
+                response=response_text,
+                confidence=0.85,  # For a real agent, this would be dynamically calculated
+                sources=[]  # In a real agent, this would include sources
+            )
+            
+            total_duration = time.time() - start_time
+            logger.info(f"Generated response with {len(response_text)} characters in {total_duration:.2f} seconds")
+            return agent_response
+            
+        except Exception as e:
+            logger.error(f"Error processing query: {e}", exc_info=True)
+            error_duration = time.time() - start_time
+            logger.error(f"Query processing failed after {error_duration:.2f} seconds")
+            
+            # Return a fallback response
+            return AgentResponse(
+                response="I'm sorry, but I encountered an error processing your request.",
+                confidence=0.0,
+                sources=[]
+            )
 
 # For simple usage
 async def process_query(query: str, context: Optional[Dict[str, Any]] = None) -> str:

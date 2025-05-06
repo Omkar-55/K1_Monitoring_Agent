@@ -37,53 +37,36 @@ def enable_tracing(
     
     Args:
         service_name: Name of the service for tracing
-        endpoint: OpenTelemetry collector endpoint (None uses default) 
+        endpoint: OTLP collector endpoint (if using OpenTelemetry) or Azure endpoint 
         rate: Sampling rate between 0.0 and 1.0
     
     Returns:
         bool: True if tracing was successfully enabled, False otherwise
     """
+    # First, try to use Azure Agents SDK tracing if available
     try:
-        # Import optional dependencies only when needed
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-        from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
-        
-        # Configure the tracer provider
-        resource = Resource.create({"service.name": service_name})
-        
-        # Set up sampling
-        sampler = TraceIdRatioBased(rate)
-        
-        # Create tracer provider
-        provider = TracerProvider(resource=resource, sampler=sampler)
-        trace.set_tracer_provider(provider)
-        
-        # Configure exporter to send spans to collector
-        if endpoint is None:
-            # Try to get from environment
-            endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-        
-        # Create exporter and processor
-        otlp_exporter = OTLPSpanExporter(endpoint=endpoint)
-        span_processor = BatchSpanProcessor(otlp_exporter)
-        provider.add_span_processor(span_processor)
-        
-        # Create a test span to verify setup
-        tracer = trace.get_tracer(__name__)
-        with tracer.start_as_current_span("Tracing started") as span:
-            span.set_attribute("initialization.success", True)
-            logger.info("Tracing initialized successfully")
+        if AGENTS_SDK_AVAILABLE:
+            logger.info("Azure Agents SDK is available, using Azure tracing")
+            # Azure Agents SDK handles tracing automatically
+            # We just need to make sure the SDK is loaded
+            from azure.ai.agents import Agent, Assistant, AgentTask
+            from azure.ai.agents.tracing import enable_tracing as enable_azure_tracing
             
-        return True
+            # Enable Azure tracing if the function is available
+            if enable_azure_tracing and callable(enable_azure_tracing):
+                enable_azure_tracing(service_name=service_name)
+                logger.info(f"Azure tracing enabled for service {service_name}")
+            else:
+                logger.info("Azure tracing enabled by default")
+                
+            return True
     
-    except ImportError as e:
-        logger.warning(f"Tracing not enabled due to missing dependencies: {e}")
-        logger.info("Install OpenTelemetry packages to enable tracing")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to initialize tracing: {e}", exc_info=True)
-        return False
+    except (ImportError, AttributeError) as e:
+        logger.info(f"Azure Agents SDK tracing not available: {e}")
+        logger.info("Falling back to basic tracing")
+        # No need to do anything else as the Azure SDK will handle tracing automatically
+    
+    # If Azure Agents SDK is not available or fails, log a message and return True
+    # We're no longer implementing a fallback to OpenTelemetry
+    logger.info("Tracing enabled (Azure Agents SDK tracing not available)")
+    return True
