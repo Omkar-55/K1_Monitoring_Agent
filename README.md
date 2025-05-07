@@ -24,8 +24,7 @@ A monitoring agent with robust logging and tracing capabilities specifically des
 │   │   └── databricks_monitoring/ # Advanced diagnosis tools
 │   │
 │   └── agents/              # Agent implementations
-│       ├── databricks_monitoring_agent.py # Primary Databricks agent with AI capabilities
-│       └── monitoring_agent.py # Basic monitoring agent
+│       └── databricks_monitoring_agent.py # Primary Databricks agent with AI capabilities
 │
 ├── tests/
 │   ├── unit/                # Unit tests
@@ -91,21 +90,15 @@ python -m src.cli monitor --job-id JOB_ID
 
 ### Using the Monitoring Agent
 
-The K1 Monitoring Agent features two key agent implementations:
+The K1 Monitoring Agent is focused on intelligent monitoring and issue resolution for Databricks workspaces. It uses the DatabricksMonitoringAgent to provide:
 
-1. **DatabricksMonitoringAgent (Primary)** - An advanced agent with:
-   - AI-powered diagnostics for job failures
-   - Automated fix suggestions and implementation
-   - Verification of applied fixes
-   - Safety checks and guardrails
-   - Hallucination detection
+- Automated diagnosis of job failures
+- Intelligent fix suggestions
+- Implementation of approved fixes
+- Verification of fix effectiveness
+- Comprehensive reporting
 
-2. **MonitoringAgent (Basic)** - A simpler agent focused on:
-   - Databricks workspace status monitoring
-   - Listing clusters and jobs 
-   - Basic log retrieval
-
-For most production scenarios, the DatabricksMonitoringAgent is recommended and used as the primary agent in the application workflow.
+The agent can be accessed through the Streamlit UI or the command-line interface.
 
 ### Testing
 
@@ -182,3 +175,16 @@ response = await adapter.process_agents_sdk_request(request)
 ## License
 
 [Your License Information]
+
+## Architecture
+
+The K1 Monitoring Agent is structured around a powerful agent for Databricks workspace monitoring and issue resolution:
+
+1. **DatabricksMonitoringAgent (Primary)** - An advanced agent with:
+   - AI-powered diagnostics
+   - Automated fix generation and application
+   - Safety checks and guardrails
+   - Verification of fix effectiveness
+   - Comprehensive reporting
+
+For production scenarios, the DatabricksMonitoringAgent is the primary agent used in the application workflow.

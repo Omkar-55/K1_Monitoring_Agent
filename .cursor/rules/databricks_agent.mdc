@@ -1,5 +1,59 @@
 ---
-description:
-globs:
+description: 
+globs: 
 alwaysApply: false
 ---
+# DatabricksMonitoringAgent Usage Guidelines
+
+- **Always Use DatabricksMonitoringAgent as Primary Agent**
+  - The `DatabricksMonitoringAgent` is the primary agent in the K1 Monitoring Agent system
+  - It has full support for diagnosing and fixing issues in Databricks jobs
+
+## Importing the Agent
+
+```python
+# ✅ DO: Import the DatabricksMonitoringAgent
+from src.agents.databricks_monitoring_agent import (
+    DatabricksMonitoringAgent,
+    MonitoringRequest,
+    MonitoringResponse
+)
+
+# ❌ DON'T: Import from other locations
+```
+
+## Agent Usage Guidelines
+
+- **Agent Responsibilities**
+  - Use `DatabricksMonitoringAgent` for:
+    - Diagnosing job failures
+    - Suggesting fixes
+    - Applying approved fixes
+    - Verifying fix effectiveness
+    - Generating detailed reports
+
+- **Safety Features**
+  - **DatabricksMonitoringAgent includes guardrails**
+    - Input validation to prevent misuse
+    - Output validation to prevent hallucinations
+    - Safety checks for all fix suggestions
+    - Permission checking before applying fixes
+
+## Request and Response Models
+
+Use the provided request and response models:
+
+```python
+# ✅ DO: Use the request model
+request = MonitoringRequest(
+    job_id="123456",
+    run_id="789012",
+    simulate=False
+)
+
+# ✅ DO: Process response properly
+response = await agent.process_request(request)
+if response.issue_detected:
+    print(f"Issue: {response.issue_type}")
+    print(f"Fix successful: {response.fix_successful}")
+```

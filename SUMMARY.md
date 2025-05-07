@@ -28,12 +28,12 @@
      - Report generation
 
 3. **Agent Implementation**
-   - Developed `MonitoringAgent` with:
-     - Natural language query processing
-     - Query classification using regex patterns
-     - Parameter extraction from queries
-     - Structured responses
-     - Error handling
+   - Developed `DatabricksMonitoringAgent` with:
+     - AI-powered diagnostics for Databricks job failures
+     - Automated fix suggestions and implementation
+     - Fix verification logic
+     - Safety checks and guardrails to prevent issues
+     - Integration with the Agents SDK
 
 4. **Testing and Documentation**
    - Created a test script for the monitoring agent
