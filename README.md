@@ -1,6 +1,6 @@
 # K1 Monitoring Agent
 
-A monitoring agent with robust logging and tracing capabilities.
+A monitoring agent with robust logging and tracing capabilities specifically designed for Databricks workspaces.
 
 ## Project Structure
 
@@ -15,14 +15,17 @@ A monitoring agent with robust logging and tracing capabilities.
 │   │   └── agents_sdk_adapter.py # Agents SDK integration
 │   │
 │   ├── app/                 # Streamlit UI
-│   │   ├── main.py          # Import agent_core.logging_config
+│   │   ├── main.py          # Web application interface
 │   │   └── requirements.txt
 │   │
 │   ├── tools/               # Agent tools
-│   │   └── databricks_tools.py # Databricks-specific tools
+│   │   ├── databricks_tools.py # Databricks-specific tools
+│   │   ├── azure_openai_tools.py # Azure OpenAI integration
+│   │   └── databricks_monitoring/ # Advanced diagnosis tools
 │   │
 │   └── agents/              # Agent implementations
-│       └── monitoring_agent.py # Main monitoring agent
+│       ├── databricks_monitoring_agent.py # Primary Databricks agent with AI capabilities
+│       └── monitoring_agent.py # Basic monitoring agent
 │
 ├── tests/
 │   ├── unit/                # Unit tests
@@ -35,9 +38,12 @@ A monitoring agent with robust logging and tracing capabilities.
 
 ## Features
 
+- **Databricks Monitoring**: Advanced monitoring for Databricks workspaces
+- **AI-Powered Diagnosis**: Intelligent diagnosis of Databricks job failures
+- **Automated Fixes**: Suggests and applies fixes to common Databricks issues
 - **Centralized Logging**: File and console logging with configurable log levels
 - **Distributed Tracing**: OpenTelemetry-based tracing for monitoring requests
-- **Azure OpenAI Integration**: Easily connect to Azure OpenAI services
+- **Azure OpenAI Integration**: Connects to Azure OpenAI for intelligent analysis
 - **Agents SDK Integration**: Adapter for the Agents SDK protocol
 - **Streamlit UI**: Web interface for configuration and usage
 
@@ -53,14 +59,20 @@ A monitoring agent with robust logging and tracing capabilities.
 
 2. Install dependencies:
    ```bash
-   pip install -r src/app/requirements.txt
+   pip install -r requirements.txt
    ```
 
 3. Set up environment variables:
    ```
+   # Azure OpenAI credentials
    AZURE_OPENAI_API_KEY=your-api-key
    AZURE_OPENAI_ENDPOINT=your-endpoint
    AZURE_OPENAI_API_VERSION=2023-05-15
+   AZURE_OPENAI_DEPLOYMENT=gpt-4
+   
+   # Databricks credentials
+   DATABRICKS_HOST=your-databricks-workspace
+   DATABRICKS_TOKEN=your-databricks-token
    ```
 
 ### Running the Application
@@ -70,6 +82,30 @@ To run the Streamlit application:
 ```bash
 streamlit run src/app/main.py
 ```
+
+To run the command-line interface:
+
+```bash
+python -m src.cli monitor --job-id JOB_ID
+```
+
+### Using the Monitoring Agent
+
+The K1 Monitoring Agent features two key agent implementations:
+
+1. **DatabricksMonitoringAgent (Primary)** - An advanced agent with:
+   - AI-powered diagnostics for job failures
+   - Automated fix suggestions and implementation
+   - Verification of applied fixes
+   - Safety checks and guardrails
+   - Hallucination detection
+
+2. **MonitoringAgent (Basic)** - A simpler agent focused on:
+   - Databricks workspace status monitoring
+   - Listing clusters and jobs 
+   - Basic log retrieval
+
+For most production scenarios, the DatabricksMonitoringAgent is recommended and used as the primary agent in the application workflow.
 
 ### Testing
 
@@ -126,7 +162,7 @@ adapter = AgentsSdkAdapter()
 request = AgentsSdkRequest(
     messages=[
         {"role": "system", "content": "You are a helpful assistant"},
-        {"role": "user", "content": "What is the status of the monitoring system?"}
+        {"role": "user", "content": "What is the status of the Databricks job?"}
     ],
     metadata={"conversation_id": "test-123"}
 )
@@ -141,6 +177,7 @@ response = await adapter.process_agents_sdk_request(request)
 - OpenTelemetry packages
 - Azure OpenAI access
 - Agents SDK (for protocol integration)
+- Databricks API access
 
 ## License
 

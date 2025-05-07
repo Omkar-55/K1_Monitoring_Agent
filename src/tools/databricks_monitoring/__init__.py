@@ -1,20 +1,43 @@
 """
-Tools for monitoring and fixing Databricks jobs.
+Databricks Monitoring Tools
+
+This package contains tools for monitoring Databricks workspaces
+and diagnosing/fixing issues with jobs and clusters.
 """
 
-from .diagnostic_tools import FailureType, diagnose, simulate_run
+# Import the diagnostic tools
+from .diagnostic_tools import (
+    diagnose, 
+    diagnose_with_ai,
+    diagnose_pattern_matching,
+    FailureType,
+    simulate_run
+)
+
+# Import log tools
 from .log_tools import get_logs
-from .fix_tools import suggest_fix, apply_fix
+
+# Import fix tools
+from .fix_tools import (
+    suggest_fix,
+    apply_fix
+)
+
+# Import verification tools
 from .verification_tools import verify
+
+# Import reporting tools
 from .reporting_tools import final_report
 
 __all__ = [
-    "FailureType",
-    "diagnose",
-    "get_logs",
-    "suggest_fix",
-    "apply_fix",
-    "verify",
-    "final_report",
-    "simulate_run"
+    'diagnose',
+    'diagnose_with_ai',
+    'diagnose_pattern_matching',
+    'FailureType',
+    'get_logs',
+    'suggest_fix',
+    'apply_fix',
+    'verify',
+    'final_report',
+    'simulate_run'
 ] 
