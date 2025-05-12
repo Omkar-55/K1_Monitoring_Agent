@@ -123,12 +123,29 @@ def _simulate_logs(job_id: str, run_id: Optional[str] = None, simulate_failure_t
     # Determine the failure type
     if simulate_failure_type:
         try:
+            # Direct mapping from UI to FailureType
             failure_type = FailureType(simulate_failure_type)
+            logger.info(f"Using specified failure type: {failure_type.value}")
         except ValueError:
-            logger.warning(f"Invalid failure type: {simulate_failure_type}. Using random type.")
-            failure_type = random.choice(list(FailureType))
+            # If it's not a valid enum, check if it matches any enum value case-insensitively
+            found = False
+            for enum_val in FailureType:
+                if enum_val.value.lower() == simulate_failure_type.lower():
+                    failure_type = enum_val
+                    found = True
+                    logger.info(f"Mapped input '{simulate_failure_type}' to failure type: {failure_type.value}")
+                    break
+            
+            if not found:
+                logger.warning(f"Invalid failure type: {simulate_failure_type}. Using random type.")
+                failure_type = random.choice(list(FailureType))
     else:
         failure_type = random.choice(list(FailureType))
+    
+    logger.info(f"Using failure type for log simulation: {failure_type.value}")
+    
+    # Add to make sure the simulate_failure_type value is correctly passed to diagnostic_tools.py
+    simulated_failure_type = failure_type.value
     
     # Common log entries that appear in most runs
     common_stdout = [
@@ -356,5 +373,5 @@ def _simulate_logs(job_id: str, run_id: Optional[str] = None, simulate_failure_t
         },
         "timestamp": time.time(),
         "simulated": True,
-        "simulate_failure_type": failure_type.value
+        "simulate_failure_type": simulated_failure_type
     } 

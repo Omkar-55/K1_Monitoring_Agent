@@ -589,14 +589,14 @@ class DatabricksMonitoringAgent:
                     logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')} (confidence: {fix_suggestion.get('confidence', 0.0)}) - awaiting user approval")
                 else:
                     logger.warning("AGENT STATE: No fix could be suggested for the diagnosed issue")
-            else:
+                else:
                 logger.info(f"AGENT STATE: User approved fix, but details weren't found. In normal operation, regenerating fix")
         else:
             logger.info("AGENT STATE: No issues detected in the logs")
         
         logger.info(f"AGENT STATE: Returning response: {response}")
-        return response
-    
+            return response
+            
     async def _get_logs(self, job_id: str, simulate: bool = False, simulate_failure_type: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
         """
         Get logs for the specified job.
@@ -616,21 +616,19 @@ class DatabricksMonitoringAgent:
             # Generate a unique run ID with timestamp to avoid collisions
             timestamp = int(time.time())
             run_id = f"run_{timestamp}"
-            logs_data = {
-                "run_id": run_id,
-                "job_id": job_id,
-                "simulated": True,
-                "simulated_failure_type": simulate_failure_type,
-                "logs": []  # We'll generate fake logs based on the failure type
-            }
+            
+            # Get simulated logs using the tools helper
+            logs_data = await self.tools.get_logs(job_id, run_id, simulate=True, simulate_failure_type=simulate_failure_type)
+            
             logger.info(f"AGENT STATE: Using simulated run data for failure type: {simulate_failure_type}")
+            return logs_data, run_id
         else:
             logger.info(f"AGENT STATE: Getting real logs for job {job_id}")
             # Get the most recent run for the job
             try:
                 run_id = await self.dbx_client.get_most_recent_run_id(job_id)
                 logger.info(f"AGENT STATE: Found most recent run ID: {run_id}")
-            except Exception as e:
+        except Exception as e:
                 logger.error(f"Error getting most recent run ID: {e}")
                 # Generate a placeholder run ID
                 timestamp = int(time.time())
@@ -640,7 +638,7 @@ class DatabricksMonitoringAgent:
             try:
                 logs_data = await self.tools.get_logs(job_id, run_id)
                 logger.info(f"AGENT STATE: Retrieved {len(logs_data.get('logs', []))} log entries for run {run_id}")
-            except Exception as e:
+                except Exception as e:
                 logger.error(f"Error getting logs: {e}")
                 logs_data = {
                     "run_id": run_id,
@@ -666,6 +664,13 @@ class DatabricksMonitoringAgent:
         logger.info(f"AGENT STATE: Diagnosing logs for run {run_id}")
         
         try:
+            # Make sure simulate_failure_type is properly passed through
+            if logs_data.get("simulated", False) and "simulate_failure_type" in logs_data:
+                logger.info(f"AGENT STATE: Using simulated failure type for diagnosis: {logs_data['simulate_failure_type']}")
+                # Preserve the simulate_failure_type in the diagnostic process
+                if "logs" not in logs_data:
+                    logs_data["logs"] = {}
+                
             diagnosis = await self.tools.diagnose(logs_data, run_id)
             
             # If we have an issue_type but no issue_detected flag, set it to True
@@ -833,16 +838,16 @@ async def monitor_databricks_job(
     )
     
     response = await agent.process_request(request)
-    return response.dict()
+    return response.dict() 
 
 # Helper class for tools
 class DatabricksTools:
     """Tools for Databricks monitoring agent."""
     
-    async def get_logs(self, job_id: str, run_id: str = None) -> Dict[str, Any]:
+    async def get_logs(self, job_id: str, run_id: str = None, simulate: bool = False, simulate_failure_type: Optional[str] = None) -> Dict[str, Any]:
         """Get logs for the specified job and run."""
         from src.tools.databricks_monitoring import get_logs
-        return get_logs(job_id, run_id)
+        return get_logs(job_id, run_id, simulate, simulate_failure_type)
     
     async def diagnose(self, logs_data: Dict[str, Any], run_id: str = None) -> Dict[str, Any]:
         """Diagnose issues in the logs."""

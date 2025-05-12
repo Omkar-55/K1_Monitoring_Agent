@@ -122,15 +122,36 @@ def get_databricks_logs(run_id=None):
 
 # Async function to process Databricks monitoring job
 async def process_monitoring_job(job_id, run_id=None, approved_fix=None, simulate=False, failure_type=None):
-    """Process a monitoring job with the DatabricksMonitoringAgent"""
+    """
+    Process a monitoring job and return the result
+    """
     try:
+        # Create a unique conversation ID if we don't have one
+        if "conversation_id" not in st.session_state:
+            st.session_state.conversation_id = str(uuid.uuid4())
+        
+        logger.info(f"Processing monitoring job: {job_id}")
+        
+        # Check if we should use random failure type
+        if simulate and failure_type == "random":
+            # Don't specify a type, let the system choose randomly
+            failure_type = None
+            logger.info("Using random failure type for simulation")
+        elif simulate:
+            # Log the explicit failure type for debugging
+            logger.info(f"Using explicit failure type for simulation: {failure_type}")
+        
+        # Generate a unique conversation ID if needed
+        if not st.session_state.get("conversation_id"):
+            st.session_state.conversation_id = str(uuid.uuid4())
+            
         # Create the request
         request = MonitoringRequest(
             job_id=job_id,
             run_id=run_id,
+            approved_fix=approved_fix,
             simulate=simulate,
             simulate_failure_type=failure_type,
-            approved_fix=approved_fix,
             conversation_id=st.session_state.conversation_id
         )
         
@@ -292,15 +313,29 @@ async def process_approved_fix():
         # Check for success in multiple ways (handle both response formats)
         is_successful = False
         
-        # Check the fix_successful property if it exists
+        # Check various potential success indicators
         if hasattr(new_response, 'fix_successful') and new_response.fix_successful:
             is_successful = True
+            logger.info("Fix marked successful via fix_successful property")
         
         # Also check if there's a status field with 'success' value (from fix_tools.py)
-        if (hasattr(new_response, 'status') and new_response.status == 'success') or \
-           (hasattr(new_response, '__dict__') and getattr(new_response, '__dict__', {}).get('status') == 'success'):
+        if hasattr(new_response, 'status') and new_response.status == 'success':
             is_successful = True
-            
+            logger.info("Fix marked successful via status='success' property")
+        
+        # Check dictionary-style response (tools might return plain dict)
+        if isinstance(new_response, dict) and new_response.get('status') == 'success':
+            is_successful = True
+            logger.info("Fix marked successful via dict status='success'")
+        
+        # For BaseModel responses, check internal __dict__
+        if hasattr(new_response, '__dict__') and getattr(new_response, '__dict__', {}).get('status') == 'success':
+            is_successful = True
+            logger.info("Fix marked successful via __dict__.status='success'")
+        
+        # Log the full response structure in debug mode
+        logger.debug(f"Fix response structure: {new_response}")
+        
         # Show the appropriate message based on success status
         if is_successful:
             st.session_state.messages.append({
@@ -578,11 +613,23 @@ def initialize_sidebar():
     
     # Only show failure type if simulate is enabled
     if st.session_state.simulate:
+        # Ensure the option names exactly match the enum values in diagnostic_tools.py
         st.session_state.failure_type = st.sidebar.selectbox(
-            "Simulated Failure",
-            options=["memory_exceeded", "dependency_error", "disk_space_exceeded"],
-            index=0
+            "Simulated Failure Type",
+            options=["memory_exceeded", "disk_space_exceeded", "dependency_error", "random"],
+            index=0,
+            help="Select the type of failure to simulate, or 'random' to get different failures each time"
         )
+        
+        # Display current simulation settings with clear labels
+        simulation_display = {
+            "memory_exceeded": "Memory Exceeded (Java heap space, GC overhead)",
+            "disk_space_exceeded": "Disk Space Exceeded (No space left on device)",
+            "dependency_error": "Dependency Error (Missing libraries, ClassNotFoundException)",
+            "random": "Random Failure (choose randomly each time)"
+        }
+        
+        st.sidebar.info(f"Current simulation: {simulation_display.get(st.session_state.failure_type, st.session_state.failure_type)}")
     
     # Add a monitoring button
     if st.sidebar.button("Monitor Job", key="monitor_button"):

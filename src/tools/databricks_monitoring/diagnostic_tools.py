@@ -76,17 +76,17 @@ def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dic
     # Always use AI-based diagnosis
     try:
         logger.info("Performing AI-based diagnosis")
-        ai_diagnosis = diagnose_with_ai(logs_data)
-        
-        # Check confidence threshold
+            ai_diagnosis = diagnose_with_ai(logs_data)
+            
+            # Check confidence threshold
         if ai_diagnosis.get("confidence", 0) >= 0.3:
             logger.info(f"AI diagnosis complete with confidence {ai_diagnosis.get('confidence')}")
-            return ai_diagnosis
-        else:
+                return ai_diagnosis
+            else:
             logger.warning(f"AI diagnosis confidence too low ({ai_diagnosis.get('confidence')})")
             # Even with low confidence, still return the AI diagnosis
             return ai_diagnosis
-    except Exception as e:
+        except Exception as e:
         logger.error(f"AI diagnosis failed: {e}")
         # Return a basic unknown error diagnosis
         return {
@@ -225,8 +225,8 @@ def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
             issue_type = _extract_issue_type_from_text(content)
             
             logger.warning(f"Couldn't parse JSON response, extracted issue type: {issue_type}")
-            
-            return {
+        
+        return {
                 "issue_type": issue_type.value,
                 "confidence": 0.6,
                 "evidence": [],
@@ -259,7 +259,7 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
     # Determine failure type - either use requested type or random
     if failure_type_str:
         try:
-            # Try to use the exact string if it matches an enum value
+            # Direct mapping - ensure UI selection maps to correct failure type
             failure_type = FailureType(failure_type_str)
             logger.info(f"Using specified failure type: {failure_type.value}")
         except ValueError:
@@ -273,11 +273,11 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                     break
             
             if not found:
-                logger.warning(f"Invalid failure type: {failure_type_str}. Using MEMORY_EXCEEDED as default.")
-                failure_type = FailureType.MEMORY_EXCEEDED
+                logger.warning(f"Invalid failure type: {failure_type_str}. Using random failure type.")
+            failure_type = random.choice(list(FailureType))
     else:
-        # Default to memory exceeded for consistent testing
-        failure_type = FailureType.MEMORY_EXCEEDED
+        # If no failure type specified, use random
+        failure_type = random.choice(list(FailureType))
     
     run_id = f"run_{int(time.time())}"
     logger.info(f"Simulated run {run_id} with failure type: {failure_type.value}")
