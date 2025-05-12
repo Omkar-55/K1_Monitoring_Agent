@@ -9,7 +9,6 @@ and diagnosing/fixing issues with jobs and clusters.
 from .diagnostic_tools import (
     diagnose, 
     diagnose_with_ai,
-    diagnose_pattern_matching,
     FailureType,
     _simulate_diagnosis
 )
@@ -32,7 +31,6 @@ from .reporting_tools import final_report
 __all__ = [
     'diagnose',
     'diagnose_with_ai',
-    'diagnose_pattern_matching',
     'FailureType',
     'get_logs',
     'suggest_fix',

@@ -9,9 +9,10 @@ import os
 import json
 import time
 import asyncio
+import uuid
 from typing import Dict, Any, List, Optional, Tuple, Union
-from pydantic import BaseModel, Field
 from enum import Enum, auto
+from pydantic import BaseModel, Field
 
 # Import the Azure Agents SDK components
 try:
@@ -135,6 +136,8 @@ class DatabricksMonitoringAgent:
     def __init__(self):
         """Initialize the agent with necessary clients and configuration."""
         self.dbx_client = DbxClient()
+        self.tools = DatabricksTools()
+        self.memory = FixMemoryStore()
         
         # Initialize Azure Agents SDK components if available
         if AGENTS_SDK_AVAILABLE:
@@ -504,635 +507,247 @@ class DatabricksMonitoringAgent:
         
     async def process_request(self, request: MonitoringRequest) -> MonitoringResponse:
         """
-        Process a monitoring request for a Databricks job.
-        
-        Args:
-            request: The monitoring request
-            
-        Returns:
-            The monitoring response with results
+        Process the monitoring request and return a monitoring response.
         """
-        logger.info(f"Processing monitoring request for job {request.job_id}")
+        logger.info(f"AGENT STATE: Starting to process request: {request}")
+        
+        # Extract required fields from the request
+        job_id = request.job_id
+        logger.info(f"AGENT STATE: Processing monitoring request for job {job_id}")
         
         # Initialize the response
         response = MonitoringResponse(
-            job_id=request.job_id,
-            run_id=request.run_id or "unknown",
+            job_id=job_id,
+            run_id="pending",  # Default value while we wait to get the real run_id
             issue_detected=False,
+            issue_type=None,
+            confidence=0.0,
             reasoning=[],
-            conversation_id=request.conversation_id
+            suggested_fix=None,
+            fix_successful=None,
+            report=None,
         )
         
-        try:
-            # Step 1: Get logs for the job
-            reasoning_step = {"step": "log_collection", "timestamp": time.time()}
-            
-            if request.simulate:
-                logs_data = get_logs(
-                    request.job_id, 
-                    request.run_id, 
-                    simulate=True, 
-                    simulate_failure_type=request.simulate_failure_type or "memory_exceeded"
-                )
-                logger.info(f"Using simulated run data for failure type: {request.simulate_failure_type or 'memory_exceeded'}")
+        # Check if the user has approved a fix
+        if request.approved_fix:
+            logger.info(f"AGENT STATE: User approved fix: {request.approved_fix}")
+            # Attempt to find the fix in the memory store
+            fix_details = self.memory.get_fix_details(request.approved_fix)
+            if fix_details:
+                logger.info(f"AGENT STATE: Found fix details: {fix_details}")
+                # Apply the fix and update the response
+                fix_result = await self._apply_fix(fix_details, job_id)
+                response.fix_successful = fix_result.get("successful", False)
+                response.report = fix_result.get("report", "")
+                logger.info(f"AGENT STATE: Applied fix with result: {fix_result}")
+                return response
             else:
-                logs_data = get_logs(request.job_id, request.run_id)
-            
-            # Update response with run ID
-            response.run_id = logs_data.get("run_id", "unknown")
-            reasoning_step["result"] = f"Retrieved logs for run ID: {response.run_id}"
-            reasoning_step["logs_summary"] = self._summarize_logs(logs_data)
-            response.reasoning.append(reasoning_step)
-            
-            logger.info(f"Retrieved logs for run ID: {response.run_id}")
+                logger.warning(f"AGENT STATE: Approved fix {request.approved_fix} not found in history, regenerating fix suggestion")
+                # Fall through to diagnosis since we couldn't find the fix
         
-            # Step 2: Diagnose issues in the logs
-            reasoning_step = {"step": "diagnosis", "timestamp": time.time()}
+        # If not applying a fix, proceed with diagnosis
+        logger.info(f"AGENT STATE: Proceeding with diagnosis for job {job_id}")
+        
+        # Get log data for diagnosis
+        logs_data, run_id = await self._get_logs(job_id, request.simulate, request.simulate_failure_type)
+        response.run_id = run_id
+        logger.info(f"AGENT STATE: Retrieved logs for run ID: {run_id}")
+        
+        # Diagnose the issue
+        diagnosis = await self._diagnose_issue(logs_data, run_id)
+        logger.info(f"AGENT STATE: Diagnosis complete: {diagnosis}")
+        
+        # Check if an issue was detected
+        if diagnosis.get("issue_detected", False):
+            issue_type = diagnosis.get("issue_type", "unknown")
+            confidence = diagnosis.get("confidence", 0.0)
+            logger.info(f"AGENT STATE: Diagnosed issue: {issue_type} with confidence {confidence}")
             
-            try:
-                # If available, use the Azure Agents SDK for diagnosis with hallucination detection
-                if self.assistant and AGENTS_SDK_AVAILABLE:
-                    diagnosis, hallucination_info = await self._diagnose_with_assistant(logs_data)
-                    response.hallucination_detected = hallucination_info.get("detected", False)
-                    
-                    # Add hallucination info to reasoning
-                    reasoning_step["hallucination_check"] = hallucination_info
-                    
-                    # If hallucination detected, fallback to basic diagnosis
-                    if response.hallucination_detected:
-                        logger.warning(f"Hallucination detected in diagnosis with score {hallucination_info.get('score')}: {hallucination_info.get('reason')}")
-                        diagnosis = diagnose(logs_data)
-                else:
-                    # Fallback to basic diagnosis
-                    diagnosis = diagnose(logs_data)
-            except (InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered) as e:
-                logger.warning(f"Guardrail triggered during diagnosis: {e}")
-                diagnosis = diagnose(logs_data)
-                reasoning_step["guardrail_triggered"] = {
-                    "message": str(e),
-                    "step": "diagnosis"
-                }
-            
-            # Extract diagnosis results
+            # Update the response with the diagnosis results
             response.issue_detected = True
-            response.issue_type = diagnosis.get("issue_type")
-            
-            reasoning_step["result"] = f"Diagnosed issue: {response.issue_type}"
-            reasoning_step["details"] = diagnosis.get("reasoning", "")
-            response.reasoning.append(reasoning_step)
-            
-            logger.info(f"Diagnosed issue: {response.issue_type}")
-            
-            # Check if a previously suggested fix was approved
-            if request.approved_fix is not None:
-                # Find the approved fix in the fix history
-                approved_fix = None
-                for fix in response.fix_history:
-                    if fix.get("fix_id") == request.approved_fix:
-                        approved_fix = fix
-                        break
-                
-                if approved_fix is None:
-                    # This should be the first request with an approved fix
-                    # Continue with the fix suggestion flow to regenerate it
-                    logger.info(f"Approved fix {request.approved_fix} not found in history, regenerating fix suggestion")
-                else:
-                    # Apply the approved fix
-                    logger.info(f"Applying approved fix {request.approved_fix}")
-                    return await self._apply_approved_fix(request, response, logs_data, approved_fix)
-            
-            # Step 3: Suggest a fix (but don't apply it yet, wait for user approval)
-            fix_attempts = response.fix_attempts
-            reasoning_step = {"step": "fix_suggestion", "timestamp": time.time(), "attempt": fix_attempts + 1}
-            
-            try:
-                # If available, use the Azure Agents SDK for fix suggestion with safety checks
-                if self.assistant and AGENTS_SDK_AVAILABLE:
-                    fix_suggestion, safety_info = await self._suggest_fix_with_assistant(
-                        response.issue_type, 
-                        logs_data
-                    )
-                    fix_type = fix_suggestion.get("fix_type")
-                    fix_params = fix_suggestion.get("parameters", {})
-                    confidence = fix_suggestion.get("confidence", 0.0)
-                    response.safety_issues = safety_info.get("issues_detected", False)
-                    
-                    reasoning_step["safety_check"] = safety_info
-                    
-                    # If safety issues detected, skip this fix
-                    if response.safety_issues:
-                        reasoning_step["result"] = f"Unsafe fix detected: {fix_type}"
-                        logger.warning(f"Unsafe fix detected: {fix_type}")
-                        response.reasoning.append(reasoning_step)
-                        
-                        # Return the response with the unsafe fix warning
-                        return response
-                else:
-                    # Fallback to built-in fix suggestion
-                    fix_suggestion = suggest_fix(response.issue_type, logs_data)
-                    fix_type = fix_suggestion.get("fix_type")
-                    fix_params = fix_suggestion.get("parameters", {})
-                    confidence = fix_suggestion.get("confidence", 0.0)
-            except (InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered) as e:
-                logger.warning(f"Guardrail triggered during fix suggestion: {e}")
-                fix_suggestion = suggest_fix(response.issue_type, logs_data)
-                fix_type = fix_suggestion.get("fix_type")
-                fix_params = fix_suggestion.get("parameters", {})
-                confidence = fix_suggestion.get("confidence", 0.0)
-                reasoning_step["guardrail_triggered"] = {
-                    "message": str(e),
-                    "step": "fix_suggestion"
-                }
-            
-            # Generate a unique ID for this fix suggestion
-            import uuid
-            fix_id = str(uuid.uuid4())
-            
-            # Create structured fix suggestion for user approval
-            suggested_fix = {
-                "fix_id": fix_id,
-                "fix_type": fix_type,
-                "parameters": fix_params,
-                "confidence": confidence,
-                "timestamp": time.time(),
-                "attempt": fix_attempts + 1,
-                "description": self._generate_fix_description(fix_type, fix_params)
-            }
-            
-            # Update response
+            response.issue_type = issue_type
             response.confidence = confidence
-            response.pending_approval = True
-            response.suggested_fix = suggested_fix
+            response.reasoning = diagnosis.get("reasoning", [])
             
-            # Add to fix history
-            response.fix_history.append(suggested_fix)
-            
-            reasoning_step["result"] = f"Suggested fix: {fix_type} (confidence: {confidence})"
-            reasoning_step["parameters"] = fix_params
-            reasoning_step["fix_id"] = fix_id
-            reasoning_step["description"] = suggested_fix["description"]
-            reasoning_step["status"] = "awaiting_approval"
-            response.reasoning.append(reasoning_step)
-            
-            logger.info(f"Suggested fix: {fix_type} (confidence: {confidence}) - awaiting user approval")
-            
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error processing request: {e}", exc_info=True)
-            
-            # Update response with error details
-            error_step = {
-                "step": "error",
-                "timestamp": time.time(),
-                "result": f"Error: {str(e)}"
-            }
-            response.reasoning.append(error_step)
-            
-            return response
-            
-    async def _apply_approved_fix(self, request: MonitoringRequest, response: MonitoringResponse, 
-                               logs_data: Dict[str, Any], approved_fix: Dict[str, Any]) -> MonitoringResponse:
-        """
-        Apply a fix that has been approved by the user.
-        
-        Args:
-            request: The monitoring request
-            response: The current monitoring response
-            logs_data: The logs data for context
-            approved_fix: The approved fix details
-            
-        Returns:
-            The updated monitoring response
-        """
-        fix_attempts = response.fix_attempts
-        fix_type = approved_fix.get("fix_type")
-        fix_params = approved_fix.get("parameters", {})
-        
-        # Step 4: Apply the fix
-        reasoning_step = {"step": "fix_application", "timestamp": time.time(), "attempt": fix_attempts + 1}
-        reasoning_step["fix_id"] = approved_fix.get("fix_id")
-        
-        # Apply the fix (or simulate if requested)
-        try:
-            fix_result = apply_fix(
-                request.job_id, 
-                response.run_id, 
-                fix_type, 
-                fix_params,
-                simulate=request.simulate
-            )
-            
-            reasoning_step["result"] = fix_result.get("message", "Fix applied")
-            reasoning_step["details"] = fix_result.get("details", {})
-            response.reasoning.append(reasoning_step)
-            
-            logger.info(f"Applied fix: {fix_type}")
-        except Exception as e:
-            logger.error(f"Error applying fix: {e}", exc_info=True)
-            reasoning_step["result"] = f"Error applying fix: {str(e)}"
-            reasoning_step["status"] = "error"
-            response.reasoning.append(reasoning_step)
-            
-            # Increment fix attempts and return for another suggestion
-            response.fix_attempts = fix_attempts + 1
-            response.pending_approval = False  # Ready for a new suggestion
-            return response
-    
-        # Step 5: Verify the fix
-        reasoning_step = {"step": "fix_verification", "timestamp": time.time(), "attempt": fix_attempts + 1}
-        reasoning_step["fix_id"] = approved_fix.get("fix_id")  # Track which fix is being verified
-        
-        # Verify the fix
-        try:
-            verification_result = verify(
-                job_id=request.job_id, 
-                run_id_or_fix_details={
-                    "run_id": response.run_id,
-                    "fix_type": approved_fix.get("fix_type"),
-                    "parameters": approved_fix.get("parameters", {}),
-                    "attempt": fix_attempts + 1
-                }, 
-                simulate=request.simulate
-            )
-            
-            # Process verification result
-            status = verification_result.get("status", "failed").upper()
-            success = verification_result.get("issue_resolved", False)
-            
-            try:
-                fix_status = FixStatus[status]
-            except KeyError:
-                # Handle case where status string doesn't match enum exactly
-                fix_status = FixStatus.SUCCESSFUL if success else FixStatus.FAILED
-            
-            # Update the response based on verification results
-            response.fix_successful = success
-            
-            reasoning_step["result"] = verification_result.get("message", "Fix verification completed")
-            reasoning_step["details"] = verification_result.get("details", {})
-            reasoning_step["status"] = fix_status.name
-            response.reasoning.append(reasoning_step)
-            
-            # Generate final report if the fix was successful
-            if success:
-                logger.info(f"Fix successful on attempt {fix_attempts + 1}")
-                
-                # Generate final report
-                try:
-                    if self.assistant and AGENTS_SDK_AVAILABLE:
-                        report, hallucination_info = await self._generate_report_with_assistant(
-                            response.issue_type,
-                            response.reasoning,
-                            response.fix_successful
-                        )
-                        
-                        # If hallucination detected, fallback to basic report
-                        if hallucination_info.get("detected", False):
-                            logger.warning(f"Hallucination detected in report with score {hallucination_info.get('score')}: {hallucination_info.get('reason')}")
-                            response.hallucination_detected = True
-                            response.report = final_report(
-                                response.issue_type,
-                                response.reasoning,
-                                response.fix_successful
-                            )
-                        else:
-                            response.report = report
-                    else:
-                        response.report = final_report(
-                            response.issue_type,
-                            response.reasoning,
-                            response.fix_successful
-                        )
-                except Exception as e:
-                    logger.error(f"Error generating report: {e}", exc_info=True)
-                    response.report = final_report(
-                        response.issue_type,
-                        response.reasoning,
-                        response.fix_successful
-                    )
+            # Generate a fix suggestion if an issue was detected
+            if not request.approved_fix:  # Only suggest a fix if we're not already applying one
+                logger.info(f"AGENT STATE: Generating fix suggestion for issue: {issue_type}")
+                fix_suggestion = await self._suggest_fix(issue_type, logs_data)
+                if fix_suggestion:
+                    logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')}")
+                    # Generate a unique ID for this fix
+                    fix_id = str(uuid.uuid4())
+                    fix_suggestion["fix_id"] = fix_id
+                    
+                    # Store the fix details for later retrieval
+                    self.memory.store_fix_details(fix_id, fix_suggestion)
+                    
+                    # Add the fix suggestion to the response
+                    response.suggested_fix = fix_suggestion
+                    
+                    # Log the suggested fix for tracking
+                    logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')} (confidence: {fix_suggestion.get('confidence', 0.0)}) - awaiting user approval")
+                else:
+                    logger.warning("AGENT STATE: No fix could be suggested for the diagnosed issue")
             else:
-                logger.warning(f"Fix verification failed on attempt {fix_attempts + 1}: {verification_result.get('message')}")
-                # Increment fix attempts for the next suggestion
-                response.fix_attempts = fix_attempts + 1
-                response.pending_approval = False  # Ready for a new suggestion
-            
-        except Exception as e:
-            logger.error(f"Error verifying fix: {e}", exc_info=True)
-            reasoning_step["result"] = f"Error verifying fix: {str(e)}"
-            reasoning_step["status"] = FixStatus.FAILED.name
-            response.reasoning.append(reasoning_step)
-            
-            # Increment fix attempts for the next suggestion
-            response.fix_attempts = fix_attempts + 1
-            response.pending_approval = False  # Ready for a new suggestion
+                logger.info(f"AGENT STATE: User approved fix, but details weren't found. In normal operation, regenerating fix")
+        else:
+            logger.info("AGENT STATE: No issues detected in the logs")
         
+        logger.info(f"AGENT STATE: Returning response: {response}")
         return response
     
-    def _generate_fix_description(self, fix_type: str, parameters: Dict[str, Any]) -> str:
+    async def _get_logs(self, job_id: str, simulate: bool = False, simulate_failure_type: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
         """
-        Generate a human-readable description of the fix.
+        Get logs for the specified job.
         
         Args:
-            fix_type: The type of fix
-            parameters: The fix parameters
+            job_id: The ID of the job to get logs for.
+            simulate: Whether to simulate logs for testing.
+            simulate_failure_type: The type of failure to simulate.
             
         Returns:
-            A human-readable description
+            A tuple of (logs_data, run_id).
         """
-        if fix_type == "increase_memory":
-            return f"Increase memory allocation by {parameters.get('memory_increment', '50%')}."
+        logger.info(f"AGENT STATE: Getting logs for job {job_id}")
         
-        elif fix_type == "increase_disk_space":
-            return f"Increase disk space allocation by {parameters.get('disk_increment', '100%')}."
-        
-        elif fix_type == "install_dependencies":
-            packages = parameters.get("packages", [])
-            if packages:
-                return f"Install missing dependencies: {', '.join(packages)}."
-            else:
-                return "Install missing dependencies."
-        
-        elif fix_type == "restart_cluster":
-            return "Restart the Databricks cluster to resolve transient issues."
-        
-        elif fix_type == "update_configuration":
-            return f"Update configuration parameters: {json.dumps(parameters)}."
-        
-        else:
-            return f"Apply {fix_type} fix with parameters: {json.dumps(parameters)}."
-    
-    async def _diagnose_with_assistant(self, logs_data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """
-        Use the Azure Agents SDK to diagnose issues with hallucination detection.
-        
-        Args:
-            logs_data: The logs data to analyze
-            
-        Returns:
-            A tuple of (diagnosis_result, hallucination_info)
-        """
-        if not AGENTS_SDK_AVAILABLE or not self.assistant:
-            logger.warning("Cannot use AI assistant for diagnosis: Azure Agents SDK not available")
-            # Fall back to built-in diagnostic tools
-            diagnosis_result = diagnose(logs_data)
-            hallucination_info = {
-                "detected": False,
-                "score": 0.0,
-                "reason": "Hallucination detection unavailable (Azure Agents SDK not installed)"
+        if simulate:
+            logger.info(f"AGENT STATE: Simulating logs for job {job_id} with failure type: {simulate_failure_type}")
+            # Generate a unique run ID with timestamp to avoid collisions
+            timestamp = int(time.time())
+            run_id = f"run_{timestamp}"
+            logs_data = {
+                "run_id": run_id,
+                "job_id": job_id,
+                "simulated": True,
+                "simulated_failure_type": simulate_failure_type,
+                "logs": []  # We'll generate fake logs based on the failure type
             }
-            return diagnosis_result, hallucination_info
+            logger.info(f"AGENT STATE: Using simulated run data for failure type: {simulate_failure_type}")
+        else:
+            logger.info(f"AGENT STATE: Getting real logs for job {job_id}")
+            # Get the most recent run for the job
+            try:
+                run_id = await self.dbx_client.get_most_recent_run_id(job_id)
+                logger.info(f"AGENT STATE: Found most recent run ID: {run_id}")
+            except Exception as e:
+                logger.error(f"Error getting most recent run ID: {e}")
+                # Generate a placeholder run ID
+                timestamp = int(time.time())
+                run_id = f"error_run_{timestamp}"
             
-        logs_text = json.dumps(logs_data, indent=2)
+            # Get the logs for the run
+            try:
+                logs_data = await self.tools.get_logs(job_id, run_id)
+                logger.info(f"AGENT STATE: Retrieved {len(logs_data.get('logs', []))} log entries for run {run_id}")
+            except Exception as e:
+                logger.error(f"Error getting logs: {e}")
+                logs_data = {
+                    "run_id": run_id,
+                    "job_id": job_id,
+                    "error": str(e),
+                    "logs": []
+                }
         
-        prompt = f"""
-        Analyze these Databricks logs and identify any issues:
-        
-        {logs_text}
-        
-        Provide a diagnosis in the following format:
-        1. Issue Type: [specific error type]
-        2. Reasoning: [why you identified this issue]
-        3. Relevant Log Sections: [sections of the logs that indicate the issue]
-        """
-        
-        # Get response from the assistant
-        agent_response: AgentResponse = await self.assistant.handle_message(prompt)
-        
-        # Check for hallucinations
-        validation: ResponseValidation = self.out_of_domain_handler.validate(agent_response.content)
-        hallucination_info = {
-            "detected": validation.is_out_of_domain,
-            "score": validation.out_of_domain_score,
-            "reason": validation.reason if validation.is_out_of_domain else None
-        }
-        
-        # Parse the diagnosis from the response
-        diagnosis_text = agent_response.content
-        issue_type = self._extract_issue_type(diagnosis_text)
-        reasoning = self._extract_reasoning(diagnosis_text)
-        
-        diagnosis_result = {
-            "issue_type": issue_type,
-            "reasoning": reasoning,
-            "full_text": diagnosis_text
-        }
-        
-        return diagnosis_result, hallucination_info
+        logger.info(f"AGENT STATE: Retrieved logs for run ID: {run_id}")
+        return logs_data, run_id
     
-    async def _suggest_fix_with_assistant(self, issue_type: str, logs_data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def _diagnose_issue(self, logs_data: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         """
-        Use the Azure Agents SDK to suggest fixes with safety checks.
+        Diagnose issues in the logs.
         
         Args:
-            issue_type: The type of issue detected
-            logs_data: The logs data
+            logs_data: The logs data to diagnose.
+            run_id: The run ID.
             
         Returns:
-            A tuple of (fix_suggestion, safety_info)
+            A dictionary with the diagnosis results.
         """
-        if not AGENTS_SDK_AVAILABLE or not self.assistant:
-            logger.warning("Cannot use AI assistant for fix suggestion: Azure Agents SDK not available")
-            # Fall back to built-in fix suggestion tools
-            fix_suggestion = suggest_fix(issue_type, logs_data)
-            safety_info = {
-                "issues_detected": False,
-                "harmful_score": 0.0,
-                "harassment_score": 0.0,
-                "hate_score": 0.0,
-                "sexual_score": 0.0,
-                "self_harm_score": 0.0,
-                "reason": "Safety check unavailable (Azure Agents SDK not installed)"
-            }
-            return fix_suggestion, safety_info
+        logger.info(f"AGENT STATE: Diagnosing logs for run {run_id}")
+        
+        try:
+            diagnosis = await self.tools.diagnose(logs_data, run_id)
             
-        logs_text = json.dumps(logs_data, indent=2)
+            # If we have an issue_type but no issue_detected flag, set it to True
+            if 'issue_type' in diagnosis and diagnosis['issue_type'] and 'issue_detected' not in diagnosis:
+                diagnosis['issue_detected'] = True
+                
+            logger.info(f"AGENT STATE: Diagnosis complete with result: {diagnosis.get('issue_type', 'no issue')}")
+        except Exception as e:
+            logger.error(f"Error during diagnosis: {e}")
+            diagnosis = {
+                "issue_detected": False,
+                "issue_type": "unknown",
+                "confidence": 0.0,
+                "reasoning": [
+                    {"step": "error", "description": f"Error during diagnosis: {str(e)}"}
+                ]
+            }
         
-        prompt = f"""
-        Suggest a fix for this Databricks issue:
-        
-        Issue Type: {issue_type}
-        
-        Logs:
-        {logs_text}
-        
-        Provide a fix suggestion in the following format:
-        1. Fix Type: [specific fix action]
-        2. Parameters: [settings or configurations]
-        3. Confidence: [numerical score 0.0-1.0]
-        4. Reasoning: [why this fix should work]
-        """
-        
-        # Get response from the assistant
-        agent_response: AgentResponse = await self.assistant.handle_message(prompt)
-        
-        # Check for safety issues
-        content_filter_results: ContentFilterResults = self.safety_policy.evaluate(agent_response.content)
-        safety_info = {
-            "issues_detected": content_filter_results.has_filtered_content,
-            "harmful_score": content_filter_results.harmful_content_score,
-            "harassment_score": content_filter_results.harassment_content_score,
-            "hate_score": content_filter_results.hate_content_score,
-            "sexual_score": content_filter_results.sexual_content_score,
-            "self_harm_score": content_filter_results.self_harm_content_score
-        }
-        
-        # Parse the fix suggestion from the response
-        fix_text = agent_response.content
-        fix_type = self._extract_fix_type(fix_text)
-        parameters = self._extract_parameters(fix_text)
-        confidence = self._extract_confidence(fix_text)
-        
-        fix_suggestion = {
-            "fix_type": fix_type,
-            "parameters": parameters,
-            "confidence": confidence,
-            "full_text": fix_text
-        }
-        
-        return fix_suggestion, safety_info
+        return diagnosis
     
-    async def _generate_report_with_assistant(self, issue_type: str, reasoning: List[Dict[str, Any]], fix_successful: bool) -> Tuple[str, Dict[str, Any]]:
+    async def _suggest_fix(self, issue_type: str, logs_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Use the Azure Agents SDK to generate a final report.
+        Suggest a fix for the diagnosed issue.
         
         Args:
-            issue_type: The type of issue detected
-            reasoning: The reasoning steps taken
-            fix_successful: Whether the fix was successful
+            issue_type: The type of issue to suggest a fix for.
+            logs_data: The logs data.
             
         Returns:
-            A tuple of (report_text, hallucination_info)
+            A dictionary with the fix suggestion or None if no fix could be suggested.
         """
-        if not AGENTS_SDK_AVAILABLE or not self.assistant:
-            logger.warning("Cannot use AI assistant for report generation: Azure Agents SDK not available")
-            # Fall back to built-in report generation
-            report_text = final_report(issue_type, reasoning, fix_successful)
-            hallucination_info = {
-                "detected": False,
-                "score": 0.0,
-                "reason": "Report generation unavailable (Azure Agents SDK not installed)"
+        logger.info(f"AGENT STATE: Suggesting fix for issue: {issue_type}")
+        
+        try:
+            fix_suggestion = await self.tools.suggest_fix(issue_type, logs_data)
+            logger.info(f"AGENT STATE: Generated fix suggestion: {fix_suggestion.get('fix_type')}")
+            return fix_suggestion
+        except Exception as e:
+            logger.error(f"Error suggesting fix: {e}")
+            return None
+    
+    async def _apply_fix(self, fix_details: Dict[str, Any], job_id: str) -> Dict[str, Any]:
+        """
+        Apply the suggested fix.
+        
+        Args:
+            fix_details: The details of the fix to apply.
+            job_id: The job ID.
+            
+        Returns:
+            A dictionary with the result of applying the fix.
+        """
+        fix_type = fix_details.get("fix_type")
+        logger.info(f"AGENT STATE: Applying fix: {fix_type} for job {job_id}")
+        
+        try:
+            fix_result = await self.tools.apply_fix(fix_details, job_id)
+            logger.info(f"AGENT STATE: Fix application result: {fix_result}")
+            
+            # Check if the fix was successful
+            fix_success = False
+            if isinstance(fix_result, dict):
+                fix_success = fix_result.get("status") == "success"
+            
+            # Generate a report using positional arguments
+            # Argument order: issue_type, reasoning, fix_successful
+            report = await self.tools.final_report(fix_details.get("fix_type", "unknown"), [], fix_success)
+            logger.info(f"AGENT STATE: Generated report of length {len(report)}")
+            
+            result = {
+                "successful": fix_success,
+                "report": report
             }
-            return report_text, hallucination_info
-            
-        report_text = json.dumps({
-            "issue_type": issue_type,
-            "reasoning": reasoning,
-            "fix_successful": fix_successful
-        }, indent=2)
+        except Exception as e:
+            logger.error(f"Error applying fix: {e}")
+            result = {
+                "successful": False,
+                "report": f"Error applying fix: {str(e)}"
+            }
         
-        prompt = f"""
-        Generate a comprehensive final report for this Databricks monitoring session:
-        
-        {report_text}
-        
-        The report should include:
-        1. Summary of the issue
-        2. Diagnosis details
-        3. Fix attempts and their results
-        4. Recommendations for future
-        
-        Format it in Markdown with clear sections.
-        """
-        
-        # Get response from the assistant
-        agent_response: AgentResponse = await self.assistant.handle_message(prompt)
-        
-        # Check for hallucinations
-        validation: ResponseValidation = self.out_of_domain_handler.validate(agent_response.content)
-        hallucination_info = {
-            "detected": validation.is_out_of_domain,
-            "score": validation.out_of_domain_score,
-            "reason": validation.reason if validation.is_out_of_domain else None
-        }
-        
-        return agent_response.content, hallucination_info
-    
-    def _summarize_logs(self, logs_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create a summary of the logs data."""
-        return {
-            "run_id": logs_data.get("run_id"),
-            "job_id": logs_data.get("job_id"),
-            "status": logs_data.get("status"),
-            "duration_seconds": logs_data.get("duration_seconds"),
-            "log_lines_count": len(logs_data.get("logs", {}).get("stdout", "").split("\n")) + 
-                              len(logs_data.get("logs", {}).get("stderr", "").split("\n"))
-        }
-    
-    def _extract_issue_type(self, text: str) -> str:
-        """Extract issue type from assistant response."""
-        # Simple extraction logic - in a real implementation, use regex or more robust parsing
-        if "memory" in text.lower():
-            return "memory_exceeded"
-        elif "disk" in text.lower():
-            return "disk_space_exceeded"
-        elif "dependency" in text.lower():
-            return "dependency_error"
-        else:
-            return "unknown"
-    
-    def _extract_reasoning(self, text: str) -> str:
-        """Extract reasoning from assistant response."""
-        # Simple extraction logic
-        if "reasoning:" in text.lower():
-            parts = text.lower().split("reasoning:")
-            if len(parts) > 1:
-                return parts[1].split("\n")[0].strip()
-        return "No explicit reasoning provided"
-    
-    def _extract_fix_type(self, text: str) -> str:
-        """Extract fix type from assistant response."""
-        # Simple extraction logic
-        if "memory" in text.lower():
-            return "increase_memory"
-        elif "disk" in text.lower():
-            return "increase_disk_space"
-        elif "dependency" in text.lower() or "package" in text.lower():
-            return "install_dependencies"
-        else:
-            return "generic_fix"
-    
-    def _extract_parameters(self, text: str) -> Dict[str, Any]:
-        """Extract parameters from assistant response."""
-        # Simple extraction logic - in a real implementation, use regex or more robust parsing
-        params = {}
-        
-        if "memory" in text.lower():
-            params["memory_increment"] = "50%"
-        elif "disk" in text.lower():
-            params["disk_increment"] = "100%"
-        elif "dependency" in text.lower() or "package" in text.lower():
-            # Try to extract package names
-            package_names = []
-            lines = text.split("\n")
-            for line in lines:
-                if "install" in line.lower() and ":" not in line:
-                    parts = line.split()
-                    for part in parts:
-                        if part not in ["install", "package", "dependency", "dependencies"]:
-                            package_names.append(part.strip(",.;()[]{}\"'"))
-            
-            if package_names:
-                params["packages"] = package_names
-        
-        return params
-    
-    def _extract_confidence(self, text: str) -> float:
-        """Extract confidence score from assistant response."""
-        # Simple extraction logic
-        if "confidence:" in text.lower():
-            parts = text.lower().split("confidence:")
-            if len(parts) > 1:
-                confidence_text = parts[1].split("\n")[0].strip()
-                try:
-                    # Try to extract a numerical value
-                    confidence = float(confidence_text)
-                    return min(max(confidence, 0.0), 1.0)  # Ensure it's in the range [0.0, 1.0]
-                except ValueError:
-                    pass
-        
-        # Default confidence if not found
-        return 0.5
+        logger.info(f"AGENT STATE: Fix application complete with result: {result}")
+        return result
     
     # Action wrapper methods for the Azure Agents SDK
     
@@ -1213,4 +828,55 @@ async def monitor_databricks_job(
     )
     
     response = await agent.process_request(request)
-    return response.dict() 
+    return response.dict()
+
+# Helper class for tools
+class DatabricksTools:
+    """Tools for Databricks monitoring agent."""
+    
+    async def get_logs(self, job_id: str, run_id: str = None) -> Dict[str, Any]:
+        """Get logs for the specified job and run."""
+        from src.tools.databricks_monitoring import get_logs
+        return get_logs(job_id, run_id)
+    
+    async def diagnose(self, logs_data: Dict[str, Any], run_id: str = None) -> Dict[str, Any]:
+        """Diagnose issues in the logs."""
+        from src.tools.databricks_monitoring import diagnose
+        return diagnose(logs_data, run_id)
+    
+    async def suggest_fix(self, issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Suggest a fix for the diagnosed issue."""
+        from src.tools.databricks_monitoring import suggest_fix
+        return suggest_fix(issue_type, logs_data)
+    
+    async def apply_fix(self, fix_details: Dict[str, Any], job_id: str) -> Dict[str, Any]:
+        """Apply the suggested fix."""
+        from src.tools.databricks_monitoring import apply_fix
+        
+        # Extract values from fix_details
+        fix_type = fix_details.get("fix_type")
+        parameters = fix_details.get("parameters", {})
+        
+        return apply_fix(job_id, "unknown", fix_type, parameters, simulate=True)
+    
+    async def final_report(self, issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False) -> str:
+        """Generate a final report."""
+        from src.tools.databricks_monitoring import final_report
+        
+        return final_report(issue_type, reasoning, fix_successful)
+
+# Helper class for fix memory
+class FixMemoryStore:
+    """Memory store for fix suggestions."""
+    
+    def __init__(self):
+        """Initialize the memory store."""
+        self.fixes = {}
+    
+    def store_fix_details(self, fix_id: str, fix_details: Dict[str, Any]) -> None:
+        """Store fix details for later retrieval."""
+        self.fixes[fix_id] = fix_details
+    
+    def get_fix_details(self, fix_id: str) -> Optional[Dict[str, Any]]:
+        """Get fix details by ID."""
+        return self.fixes.get(fix_id) 

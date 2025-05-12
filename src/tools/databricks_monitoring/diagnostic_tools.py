@@ -16,14 +16,6 @@ from src.agent_core.logging_config import get_logger
 # Get logger for this module
 logger = get_logger(__name__)
 
-# Regular expressions for common errors
-OOM_RE = r"java\.lang\.OutOfMemoryError|OutOfMemoryError|Memory limit exceeded|GC overhead limit exceeded|Container killed.*exceeding memory limits"
-DISK_RE = r"No space left on device|Disk quota exceeded|IOException.*space|DiskBlockManager.*disk write failed"
-DEP_RE = r"ClassNotFoundException|ModuleNotFoundError|ImportError|NoClassDefFoundError|Can\'t find resource file|library not loaded"
-QUOTA_RE = r"Quota exceeded|Resource limit exceeded|exceeded your quota"
-TIMEOUT_RE = r"Connection timed out|Read timed out|Socket timeout|Connection reset|unreachable"
-DATA_SKEW_RE = r"data skew|skewed data|imbalanced partitions"
-
 class FailureType(Enum):
     """Types of failures that can occur in Databricks jobs."""
     MEMORY_EXCEEDED = "memory_exceeded"
@@ -35,10 +27,7 @@ def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dic
     """
     Analyzes Databricks logs to identify and diagnose job failures or performance issues.
     
-    This tool uses a multi-layered approach to diagnose issues:
-    1. Pattern-based detection using regex for common errors
-    2. AI-powered analysis for complex or unclear errors
-    3. Correlation with cluster metadata and job configuration
+    This tool uses AI-powered analysis for error identification.
     
     When to use:
     - After collecting logs from a failed or problematic Databricks job
@@ -84,27 +73,29 @@ def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dic
         logger.info("Simulated run detected, generating simulated diagnosis")
         return _simulate_diagnosis(logs_data.get("simulate_failure_type"))
     
-    # Determine which diagnostic method to use
-    use_ai = os.getenv("USE_AI_DIAGNOSIS", "true").lower() in ["true", "1", "yes"]
-    
-    # Try AI diagnosis first if enabled
-    if use_ai:
-        try:
-            logger.info("Attempting AI-based diagnosis")
-            ai_diagnosis = diagnose_with_ai(logs_data)
-            
-            # Check confidence threshold
-            if ai_diagnosis.get("confidence", 0) >= 0.6:
-                logger.info(f"AI diagnosis successful with confidence {ai_diagnosis.get('confidence')}")
-                return ai_diagnosis
-            else:
-                logger.info(f"AI diagnosis confidence too low ({ai_diagnosis.get('confidence')}), falling back to pattern matching")
-        except Exception as e:
-            logger.warning(f"AI diagnosis failed: {e}, falling back to pattern matching")
-    
-    # Fall back to pattern matching
-    logger.info("Using pattern matching for diagnosis")
-    return diagnose_pattern_matching(logs_data)
+    # Always use AI-based diagnosis
+    try:
+        logger.info("Performing AI-based diagnosis")
+        ai_diagnosis = diagnose_with_ai(logs_data)
+        
+        # Check confidence threshold
+        if ai_diagnosis.get("confidence", 0) >= 0.3:
+            logger.info(f"AI diagnosis complete with confidence {ai_diagnosis.get('confidence')}")
+            return ai_diagnosis
+        else:
+            logger.warning(f"AI diagnosis confidence too low ({ai_diagnosis.get('confidence')})")
+            # Even with low confidence, still return the AI diagnosis
+            return ai_diagnosis
+    except Exception as e:
+        logger.error(f"AI diagnosis failed: {e}")
+        # Return a basic unknown error diagnosis
+        return {
+            "issue_type": FailureType.UNKNOWN.value,
+            "confidence": 0.1,
+            "evidence": [],
+            "details": f"Failed to diagnose the issue: {str(e)}",
+            "recommendations": ["Check logs manually", "Contact support"]
+        }
 
 def _extract_issue_type_from_text(text: str) -> FailureType:
     """
@@ -118,63 +109,14 @@ def _extract_issue_type_from_text(text: str) -> FailureType:
     """
     text_lower = text.lower()
     
-    if re.search(OOM_RE, text_lower, re.IGNORECASE) or "memory" in text_lower:
+    if "memory" in text_lower and any(term in text_lower for term in ["oom", "out of memory", "heap space"]):
         return FailureType.MEMORY_EXCEEDED
-    elif re.search(DISK_RE, text_lower, re.IGNORECASE) or "disk" in text_lower:
+    elif "disk" in text_lower and ("space" in text_lower or "quota" in text_lower):
         return FailureType.DISK_SPACE_EXCEEDED
-    elif re.search(DEP_RE, text_lower, re.IGNORECASE) or "dependency" in text_lower:
+    elif any(term in text_lower for term in ["dependency", "module", "package", "import", "library"]):
         return FailureType.DEPENDENCY_ERROR
     else:
         return FailureType.UNKNOWN
-
-def _basic_diagnosis(stdout: str, stderr: str) -> Dict[str, Any]:
-    """
-    Perform a basic diagnosis using pattern matching.
-    
-    Args:
-        stdout: Standard output logs
-        stderr: Standard error logs
-        
-    Returns:
-        Dictionary with diagnosis results
-    """
-    # Combine logs
-    combined_logs = f"{stdout}\n{stderr}"
-    
-    # Check for memory issues
-    if re.search(OOM_RE, combined_logs, re.IGNORECASE):
-        return {
-            "issue_type": FailureType.MEMORY_EXCEEDED.value,
-            "confidence": 0.7,
-            "evidence": ["Out of memory error detected in logs"],
-            "details": "Memory limit exceeded"
-        }
-    
-    # Check for disk issues
-    if re.search(DISK_RE, combined_logs, re.IGNORECASE):
-        return {
-            "issue_type": FailureType.DISK_SPACE_EXCEEDED.value,
-            "confidence": 0.7,
-            "evidence": ["Disk space error detected in logs"],
-            "details": "Disk space limit exceeded"
-        }
-    
-    # Check for dependency issues
-    if re.search(DEP_RE, combined_logs, re.IGNORECASE):
-        return {
-            "issue_type": FailureType.DEPENDENCY_ERROR.value,
-            "confidence": 0.7,
-            "evidence": ["Dependency error detected in logs"],
-            "details": "Missing dependencies"
-        }
-    
-    # Unknown issue
-    return {
-        "issue_type": FailureType.UNKNOWN.value,
-        "confidence": 0.3,
-        "evidence": [],
-        "details": "Could not determine issue type from logs"
-    }
 
 def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -204,7 +146,13 @@ def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
     
     if not api_key or not endpoint:
         logger.warning("Azure OpenAI credentials not available")
-        return _basic_diagnosis(stdout, stderr)
+        return {
+            "issue_type": FailureType.UNKNOWN.value,
+            "confidence": 0.1,
+            "evidence": [],
+            "details": "Could not connect to AI service for analysis",
+            "recommendations": ["Check OpenAI configuration", "Check logs manually"]
+        }
     
     try:
         from openai import AzureOpenAI
@@ -277,8 +225,8 @@ def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
             issue_type = _extract_issue_type_from_text(content)
             
             logger.warning(f"Couldn't parse JSON response, extracted issue type: {issue_type}")
-        
-        return {
+            
+            return {
                 "issue_type": issue_type.value,
                 "confidence": 0.6,
                 "evidence": [],
@@ -287,239 +235,49 @@ def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
             
     except ImportError:
         logger.warning("OpenAI package not available")
-        return _basic_diagnosis(stdout, stderr)
+        return {
+            "issue_type": FailureType.UNKNOWN.value,
+            "confidence": 0.1,
+            "evidence": [],
+            "details": "OpenAI package not available for AI analysis",
+            "recommendations": ["Install OpenAI package", "Check logs manually"]
+        }
     except Exception as e:
         logger.error(f"Error in AI diagnosis: {e}")
-        return _basic_diagnosis(stdout, stderr)
-
-def extract_issue_type(text: str) -> str:
-    """
-    Extract the issue type from AI analysis.
-    
-    Args:
-        text: The AI analysis text
-        
-    Returns:
-        The issue type as a string
-    """
-    # Convert to lowercase for easier matching
-    text_lower = text.lower()
-    
-    # Check for memory issues
-    if "memory" in text_lower and any(term in text_lower for term in ["oom", "out of memory", "heap space"]) or re.search(OOM_RE, text_lower, re.IGNORECASE):
-        return FailureType.MEMORY_EXCEEDED.value
-    elif "disk" in text_lower and ("space" in text_lower or "quota" in text_lower):
-        return FailureType.DISK_SPACE_EXCEEDED.value
-    elif any(term in text_lower for term in ["dependency", "module", "package", "import", "library"]) or re.search(DEP_RE, text_lower, re.IGNORECASE):
-        return FailureType.DEPENDENCY_ERROR.value
-    elif re.search(QUOTA_RE, text_lower, re.IGNORECASE):
-        return FailureType.UNKNOWN.value
-    elif re.search(TIMEOUT_RE, text_lower, re.IGNORECASE):
-        return FailureType.UNKNOWN.value
-    elif "skew" in text_lower or "imbalance" in text_lower:
-        return FailureType.UNKNOWN.value
-    else:
-        return FailureType.UNKNOWN.value
-
-def diagnose_pattern_matching(logs_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Diagnose using pattern matching."""
-    logger.info("Diagnosing Databricks logs using pattern matching")
-    
-    # Extract logs
-    stdout = logs_data.get("stdout", "")
-    stderr = logs_data.get("stderr", "")
-    
-    # Default diagnosis
-    issue_type = FailureType.UNKNOWN
-    reasoning = "Could not determine the issue from logs"
-    confidence = 0.3
-    
-    # Check for memory issues (highest priority)
-    if "OutOfMemoryError" in stderr or "GC overhead limit exceeded" in stderr or re.search(OOM_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.MEMORY_EXCEEDED
-        reasoning = "Job failed due to memory issues. Found OutOfMemoryError or GC overhead limit exceeded in logs."
-        confidence = 0.8
-    
-    # Check for disk space issues
-    elif "No space left on device" in stderr or "Disk quota exceeded" in stderr or re.search(DISK_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.DISK_SPACE_EXCEEDED
-        reasoning = "Job failed due to disk space issues. Found 'No space left on device' or similar in logs."
-        confidence = 0.8
-    
-    # Check for dependency issues
-    elif "ModuleNotFoundError" in stderr or "ImportError" in stderr or "ClassNotFoundException" in stderr or re.search(DEP_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.DEPENDENCY_ERROR
-        reasoning = "Job failed due to missing dependencies. Found import or module errors in logs."
-        confidence = 0.8
-    
-    # Check for quota issues
-    elif re.search(QUOTA_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.UNKNOWN
-        reasoning = "Job failed due to unknown quota issues."
-        confidence = 0.7
-    
-    # Check for timeout issues
-    elif re.search(TIMEOUT_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.UNKNOWN
-        reasoning = "Job failed due to connection timeouts or unreachable components."
-        confidence = 0.7
-    
-    # If nothing specific found, try to gather some metrics for further analysis
-    elif "Exception" in stderr or "Error" in stderr:
-        issue_type = FailureType.UNKNOWN
-        reasoning = "Job failed with an exception, but could not determine the specific cause."
-        confidence = 0.4
-        
-        # Extract some metrics if available
-        try:
-            # Extract memory usage metrics if available
-            metrics = {}
-            worker_mems = []
-            
-            # Memory pattern: "Worker X: Y% memory used"
-            mem_pattern = r"Worker \d+: (\d+)% memory used"
-            for match in re.finditer(mem_pattern, stdout):
-                worker_mems.append(float(match.group(1)))
-                
-            if worker_mems:
-                metrics["worker_memory_usage"] = {
-                    "min": min(worker_mems),
-                    "max": max(worker_mems),
-                    "avg": sum(worker_mems) / len(worker_mems)
-                }
-                    
-                # Check for potential data skew if timeout or unknown issue
-                if issue_type in [FailureType.UNKNOWN]:
-                    # Check for imbalanced worker memory usage
-                    if worker_mems and max(worker_mems) > 2 * min(worker_mems) and max(worker_mems) > 75:
-                        issue_type = FailureType.UNKNOWN
-                        reasoning = f"Potential data skew detected. Worker memory usage varies widely from {min(worker_mems):.1f}% to {max(worker_mems):.1f}%, suggesting imbalanced data processing."
-                        confidence = 0.6
-        except Exception as e:
-            logger.warning(f"Error extracting metrics: {e}")
-    
-    # Create the diagnosis result
-    basic_diagnosis = {
-        "issue_type": issue_type.value,
-        "confidence": confidence,
-        "reasoning": reasoning,
-        "method": "pattern_matching",
-        "evidence": []
-    }
-    
-    # Extract evidence for the diagnosis
-    if "OutOfMemoryError" in stderr:
-        for line in stderr.split("\n"):
-            if "OutOfMemoryError" in line:
-                basic_diagnosis["evidence"].append(line.strip())
-                break
-    
-    # Add recommendations based on issue type
-    if issue_type == FailureType.MEMORY_EXCEEDED:
-        basic_diagnosis["recommendations"] = [
-            "Increase executor memory",
-            "Optimize join operations",
-            "Reduce shuffle partitions"
-        ]
-    elif issue_type == FailureType.DISK_SPACE_EXCEEDED:
-        basic_diagnosis["recommendations"] = [
-            "Clean up unused data files",
-            "Use more efficient storage formats"
-        ]
-    elif issue_type == FailureType.DEPENDENCY_ERROR:
-        basic_diagnosis["recommendations"] = [
-            "Install missing dependencies",
-            "Check library compatibility"
-        ]
-    else:
-        basic_diagnosis["recommendations"] = [
-            "Check logs for more details",
-            "Inspect job configuration"
-        ]
-    
-    logger.info(f"Pattern matching diagnosis complete: {issue_type.value} with confidence {confidence:.2f}")
-    return basic_diagnosis
-
-def _pattern_detection(stdout: str, stderr: str) -> Tuple[FailureType, float, List[str]]:
-    """
-    Detect issues based on pattern matching in logs.
-    
-    Args:
-        stdout: Standard output logs
-        stderr: Standard error logs
-        
-    Returns:
-        Tuple of (issue_type, confidence, evidence)
-    """
-    # Combine logs for analysis
-    combined_logs = f"{stdout}\n{stderr}"
-    evidence = []
-    
-    # Check for memory issues
-    oom_matches = re.findall(OOM_RE, combined_logs, re.IGNORECASE)
-    if oom_matches:
-        # Extract surrounding context for evidence
-        for match in oom_matches[:3]:  # Limit to first 3 matches
-            # Find the line containing the match
-            for line in combined_logs.splitlines():
-                if match in line:
-                    evidence.append(line.strip())
-                    break
-        
-        # Calculate confidence based on number and type of matches
-        confidence = min(0.6 + (len(oom_matches) * 0.1), 0.9)
-        return FailureType.MEMORY_EXCEEDED, confidence, evidence
-    
-    # Check for disk space issues
-    disk_matches = re.findall(DISK_RE, combined_logs, re.IGNORECASE)
-    if disk_matches:
-        for match in disk_matches[:3]:
-            for line in combined_logs.splitlines():
-                if match in line:
-                    evidence.append(line.strip())
-                    break
-        
-        confidence = min(0.6 + (len(disk_matches) * 0.1), 0.9)
-        return FailureType.DISK_SPACE_EXCEEDED, confidence, evidence
-    
-    # Check for dependency issues
-    dep_matches = re.findall(DEP_RE, combined_logs, re.IGNORECASE)
-    if dep_matches:
-        for match in dep_matches[:3]:
-            for line in combined_logs.splitlines():
-                if match in line:
-                    evidence.append(line.strip())
-                    break
-        
-        confidence = min(0.6 + (len(dep_matches) * 0.1), 0.9)
-        return FailureType.DEPENDENCY_ERROR, confidence, evidence
-    
-    # If no clear pattern, check for other common error indicators
-    if "error" in combined_logs.lower() or "exception" in combined_logs.lower():
-        # Extract some error lines as evidence
-        for line in combined_logs.splitlines():
-            if "error" in line.lower() or "exception" in line.lower():
-                evidence.append(line.strip())
-                if len(evidence) >= 3:
-                    break
-        
-        return FailureType.UNKNOWN, 0.4, evidence
-    
-    # No issues detected
-    return FailureType.UNKNOWN, 0.1, evidence
+        return {
+            "issue_type": FailureType.UNKNOWN.value,
+            "confidence": 0.1,
+            "evidence": [],
+            "details": f"Error in AI diagnosis: {str(e)}",
+            "recommendations": ["Check logs manually", "Review API access"]
+        }
 
 def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any]:
     """Simulate a diagnosis result for testing."""
     logger.info(f"Simulating run with failure type: {failure_type_str}")
     
+    # Determine failure type - either use requested type or random
     if failure_type_str:
         try:
+            # Try to use the exact string if it matches an enum value
             failure_type = FailureType(failure_type_str)
+            logger.info(f"Using specified failure type: {failure_type.value}")
         except ValueError:
-            logger.warning(f"Invalid failure type: {failure_type_str}. Using random type.")
-            failure_type = random.choice(list(FailureType))
+            # If it's not a valid enum, check if it matches any enum value case-insensitively
+            found = False
+            for enum_val in FailureType:
+                if enum_val.value.lower() == failure_type_str.lower():
+                    failure_type = enum_val
+                    found = True
+                    logger.info(f"Mapped input '{failure_type_str}' to failure type: {failure_type.value}")
+                    break
+            
+            if not found:
+                logger.warning(f"Invalid failure type: {failure_type_str}. Using MEMORY_EXCEEDED as default.")
+                failure_type = FailureType.MEMORY_EXCEEDED
     else:
-        failure_type = random.choice(list(FailureType))
+        # Default to memory exceeded for consistent testing
+        failure_type = FailureType.MEMORY_EXCEEDED
     
     run_id = f"run_{int(time.time())}"
     logger.info(f"Simulated run {run_id} with failure type: {failure_type.value}")
@@ -586,6 +344,7 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                 "spark.memory.fraction": "0.6",
                 "spark.memory.storageFraction": "0.5"
             },
+            "issue_detected": True
         }
     elif failure_type == FailureType.DISK_SPACE_EXCEEDED:
         # Different disk space error patterns
@@ -638,6 +397,7 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                 "used_disk_space": "98.5%",
                 "filesystem_type": "ext4"
             },
+            "issue_detected": True
         }
     elif failure_type == FailureType.DEPENDENCY_ERROR:
         # Various dependency error patterns
@@ -701,6 +461,7 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                     {"name": "numpy", "version": "1.21.3"}
                 ]
             },
+            "issue_detected": True
         }
     else:
         # Generic unknown issue
@@ -720,4 +481,5 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                 "Enable debug logging for more detailed diagnostics"
             ],
             "cluster_context": {},
+            "issue_detected": True
         } 

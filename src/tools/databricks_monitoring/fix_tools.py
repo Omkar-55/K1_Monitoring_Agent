@@ -70,7 +70,15 @@ def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
     
     # Extract relevant information from logs
     logs = logs_data.get("logs", {})
-    stderr = logs.get("stderr", "")
+    
+    # Handle the case when logs might be a list
+    if isinstance(logs, list):
+        stderr = ""
+        for log_entry in logs:
+            if isinstance(log_entry, dict) and "message" in log_entry:
+                stderr += log_entry["message"] + "\n"
+    else:
+        stderr = logs.get("stderr", "")
     
     # Initialize suggestion
     fix_type = "unknown"
@@ -273,6 +281,7 @@ def apply_fix(job_id: str, run_id: str, fix_type: str, parameters: Dict[str, Any
         # Return simulated result
         return {
             "status": "success",
+            "successful": True,
             "message": f"Applied {fix_type} fix to job {job_id} (simulation)",
             "details": {
                 "job_id": job_id,
