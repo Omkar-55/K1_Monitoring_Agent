@@ -731,8 +731,13 @@ class DatabricksMonitoringAgent:
                 fix_success = fix_result.get("status") == "success"
             
             # Generate a report using positional arguments
-            # Argument order: issue_type, reasoning, fix_successful
-            report = await self.tools.final_report(fix_details.get("fix_type", "unknown"), [], fix_success)
+            # Argument order: issue_type, reasoning, fix_successful, job_id
+            report = await self.tools.final_report(
+                fix_details.get("fix_type", "unknown"), 
+                [], 
+                fix_success,
+                job_id
+            )
             logger.info(f"AGENT STATE: Generated report of length {len(report)}")
             
             result = {
@@ -859,11 +864,11 @@ class DatabricksTools:
         
         return apply_fix(job_id, "unknown", fix_type, parameters, simulate=True)
     
-    async def final_report(self, issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False) -> str:
+    async def final_report(self, issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False, job_id: str = "unknown") -> str:
         """Generate a final report."""
         from src.tools.databricks_monitoring import final_report
         
-        return final_report(issue_type, reasoning, fix_successful)
+        return final_report(issue_type, reasoning, fix_successful, job_id)
 
 # Helper class for fix memory
 class FixMemoryStore:
