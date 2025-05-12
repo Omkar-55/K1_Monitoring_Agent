@@ -11,7 +11,7 @@ from .diagnostic_tools import (
     diagnose_with_ai,
     diagnose_pattern_matching,
     FailureType,
-    simulate_run
+    _simulate_diagnosis
 )
 
 # Import log tools
@@ -39,5 +39,5 @@ __all__ = [
     'apply_fix',
     'verify',
     'final_report',
-    'simulate_run'
+    '_simulate_diagnosis'
 ] 

@@ -68,10 +68,50 @@ class DatabricksTools:
             return {"status": "error", "message": str(e)}
         
     async def list_clusters(self) -> List[Dict[str, Any]]:
-        """List all clusters in the workspace.
+        """
+        Retrieves a list of all Databricks clusters with their current status and configuration.
         
-        Returns:
-            List of cluster information dictionaries
+        This tool provides simplified details about all clusters in the workspace including
+        running state, worker count, and node types. It's useful for getting a quick overview
+        of cluster resources or finding specific clusters for further analysis.
+        
+        When to use:
+        - To get an inventory of available clusters
+        - When looking for a specific cluster by name
+        - Before performing operations that need a cluster ID
+        - To check cluster states (running, terminated, etc.)
+        
+        No input parameters required.
+        
+        Output JSON example:
+        [
+            {
+                "cluster_id": "0123-456789-abcdef",
+                "name": "Production ETL Cluster",
+                "state": "RUNNING",
+                "creator": "john.smith@example.com",
+                "node_type": "Standard_DS3_v2",
+                "runtime": "10.4.x-scala2.12",
+                "num_workers": 4
+            },
+            {
+                "cluster_id": "0123-456789-ghijkl",
+                "name": "ML Training Cluster",
+                "state": "TERMINATED",
+                "creator": "data.scientist@example.com",
+                "node_type": "Standard_NC6s_v3",
+                "runtime": "11.3.x-cpu-ml-scala2.12",
+                "num_workers": 0
+            }
+        ]
+        
+        Error output example:
+        [
+            {
+                "status": "error",
+                "message": "Databricks client is not available"
+            }
+        ]
         """
         logger.info("Listing Databricks clusters")
         if not self.client or not self.client.is_available():
@@ -185,17 +225,58 @@ class DatabricksTools:
                      log_type: str = "audit",
                      days: int = 7,
                      limit: int = 100) -> List[Dict[str, Any]]:
-        """Get logs from Databricks.
+        """
+        Retrieves various types of Databricks logs filtered by cluster, run, time period and type.
         
-        Args:
-            cluster_id: Optional cluster ID to filter logs by
-            run_id: Optional run ID to filter logs by
-            log_type: Type of logs to retrieve (audit, cluster, etc.)
-            days: Number of days to look back
-            limit: Maximum number of log entries to return
-            
-        Returns:
-            List of log entries
+        This tool fetches logs from Databricks to help with troubleshooting and monitoring.
+        It supports different log types including audit logs, cluster logs, and job run logs.
+        Results are returned in chronological order with timestamps and metadata.
+        
+        When to use:
+        - To investigate cluster or job issues
+        - For security and compliance auditing
+        - To monitor user activities in the workspace
+        - To track historical performance patterns
+        
+        Input JSON example:
+        {
+            "cluster_id": "0123-456789-abcdef",   // Optional: Filter logs by specific cluster
+            "run_id": "987654",                   // Optional: Filter logs by specific job run
+            "log_type": "audit",                  // Optional: Type of logs to retrieve (default: "audit")
+                                                 // Options: "audit", "cluster", "driver", "executor", "stderr", "stdout"
+            "days": 7,                           // Optional: Number of days to look back (default: 7)
+            "limit": 100                         // Optional: Maximum number of log entries to return (default: 100)
+        }
+        
+        Output JSON example:
+        [
+            {
+                "timestamp": "2023-04-15T08:25:31Z",
+                "log_type": "stderr",
+                "cluster_id": "0123-456789-abcdef",
+                "user": "john.smith@example.com",
+                "message": "ERROR: java.lang.OutOfMemoryError: Java heap space",
+                "level": "ERROR",
+                "source": "driver"
+            },
+            {
+                "timestamp": "2023-04-15T08:24:15Z",
+                "log_type": "stdout",
+                "cluster_id": "0123-456789-abcdef", 
+                "user": "john.smith@example.com",
+                "message": "Starting job execution with parameters: {\"date\": \"2023-04-15\"}",
+                "level": "INFO",
+                "source": "driver"
+            }
+        ]
+        
+        Error output example:
+        [
+            {
+                "status": "error",
+                "message": "Databricks client is not available"
+            }
+        ]
         """
         logger.info(f"Getting Databricks logs (type={log_type}, days={days}, limit={limit})")
         if not self.client or not self.client.is_available():

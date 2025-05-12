@@ -59,7 +59,7 @@ class Agent:
         """
         self.deployment_name = azure_openai_deployment or os.getenv(
             "AZURE_OPENAI_DEPLOYMENT", 
-            "gpt-4"
+            "gpt-4.1"
         )
         self._initialize_client()
         logger.info(f"Agent initialized with deployment: {self.deployment_name}")

@@ -18,18 +18,21 @@ class AzureOpenAITools:
     def __init__(self, 
                 api_key: Optional[str] = None,
                 endpoint: Optional[str] = None,
-                api_version: Optional[str] = None):
+                api_version: Optional[str] = None,
+                deployment: Optional[str] = None):
         """Initialize the Azure OpenAI tools.
         
         Args:
             api_key: Azure OpenAI API key
             endpoint: Azure OpenAI endpoint
             api_version: Azure OpenAI API version
+            deployment: Azure OpenAI deployment name
         """
         logger.info("Initializing Azure OpenAI tools")
         self.api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
         self.endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
         self.api_version = api_version or os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+        self.deployment = deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
         
         # Check if required credentials are available
         self._has_credentials = bool(self.api_key and self.endpoint)
@@ -74,14 +77,51 @@ class AzureOpenAITools:
         return self._client is not None
         
     async def analyze_logs(self, logs: List[Dict[str, Any]], max_logs: int = 10) -> Dict[str, Any]:
-        """Analyze log entries to identify patterns or issues.
+        """
+        Analyzes Databricks log entries using Azure OpenAI to identify patterns, anomalies, and issues.
         
-        Args:
-            logs: List of log entries to analyze
-            max_logs: Maximum number of logs to include in the analysis
-            
-        Returns:
-            Analysis results
+        This tool leverages AI to perform deep analysis of log content that may be difficult
+        to identify with traditional pattern matching, extracting insights and potential 
+        root causes from log data.
+        
+        When to use:
+        - When standard pattern matching doesn't identify clear issues
+        - For complex logs that need semantic understanding
+        - To get advanced insights beyond simple error code matching
+        
+        Input JSON example:
+        {
+            "logs": [                          // Required: List of log entries to analyze
+                {
+                    "timestamp": "2023-04-15T08:25:31Z",
+                    "message": "Starting job execution",
+                    "level": "INFO"
+                },
+                {
+                    "timestamp": "2023-04-15T08:25:45Z",
+                    "message": "WARNING: Memory usage is high (85%)",
+                    "level": "WARN"
+                },
+                {
+                    "timestamp": "2023-04-15T08:26:12Z",
+                    "message": "ERROR: java.lang.OutOfMemoryError: Java heap space",
+                    "level": "ERROR"
+                }
+            ],
+            "max_logs": 10                     // Optional: Maximum number of logs to include (default: 10)
+        }
+        
+        Output JSON example:
+        {
+            "analysis": "The logs show a memory utilization issue that led to a Java heap space error. The memory usage was already high (85%) before the crash, indicating insufficient heap allocation for the data processing workload. Consider increasing the driver/executor memory or optimizing the query to reduce memory requirements.",
+            "log_count": 3,
+            "truncated": false
+        }
+        
+        Error output example:
+        {
+            "error": "Azure OpenAI client not available"
+        }
         """
         logger.info(f"Analyzing {len(logs)} log entries")
         if not self.is_available():
@@ -107,7 +147,7 @@ class AzureOpenAITools:
             
             # Send request to Azure OpenAI
             response = await self._client.chat.completions.create(
-                deployment_name="gpt-4",  # Adjust this to your deployment
+                deployment_name=self.deployment,
                 messages=prompt,
                 temperature=0.7,
                 max_tokens=800
@@ -169,7 +209,7 @@ class AzureOpenAITools:
             
             # Send request to Azure OpenAI
             response = await self._client.chat.completions.create(
-                deployment_name="gpt-4",  # Adjust this to your deployment
+                deployment_name=self.deployment,
                 messages=prompt,
                 temperature=0.7,
                 max_tokens=800
@@ -190,13 +230,60 @@ class AzureOpenAITools:
             return {"error": str(e)}
             
     async def generate_monitoring_report(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate a comprehensive monitoring report.
+        """
+        Generates a comprehensive, AI-enhanced monitoring report for Databricks workspaces.
         
-        Args:
-            data: Data to include in the report
-            
-        Returns:
-            Generated report
+        This tool creates detailed reports that include:
+        - Executive summary of findings
+        - Key metrics and status overview
+        - Identified issues and their severity
+        - Actionable recommendations with rationale
+        - Technical details in a structured format
+        
+        When to use:
+        - For creating detailed reports at the end of monitoring cycles
+        - To communicate technical findings to different stakeholders
+        - When you need AI-enhanced insights and recommendations
+        
+        Input JSON example:
+        {
+            "data": {                         // Required: Monitoring data to include in report
+                "workspace": "databricks-prod-analytics",
+                "timestamp": "2023-04-15T15:30:00Z",
+                "metrics": {
+                    "jobs": {
+                        "total": 125,
+                        "failed": 3,
+                        "success_rate": 97.6
+                    },
+                    "clusters": {
+                        "total": 8,
+                        "running": 5,
+                        "terminated": 2,
+                        "failed": 1
+                    }
+                },
+                "issues": [
+                    {
+                        "type": "memory_exceeded",
+                        "job_id": "123456",
+                        "severity": "high",
+                        "fix_status": "resolved"
+                    }
+                ]
+            }
+        }
+        
+        Output JSON example:
+        {
+            "report": "# Databricks Monitoring Report\n\n## Executive Summary\n\nThe monitoring period showed an overall healthy workspace with a 97.6% job success rate. One high-severity memory issue was identified and successfully resolved.\n\n## Metrics Overview\n\n- **Jobs**: 125 total, 3 failed (97.6% success rate)\n- **Clusters**: 8 total, 5 running, 2 terminated, 1 failed\n\n## Issues Identified\n\n### 1. Memory Exceeded (High Severity)\n- **Job ID**: 123456\n- **Status**: Resolved\n- **Details**: Job experienced Java heap space errors due to insufficient memory allocation\n\n## Recommendations\n\n1. Consider implementing memory usage monitoring alerts at 80% threshold\n2. Review the jobs with highest memory usage for optimization opportunities\n3. Schedule regular maintenance windows for cluster restarts\n\n## Technical Details\n\n[Additional technical metrics and details formatted in tables...]",
+            "timestamp": "2023-04-15T15:30:00Z"
+        }
+        
+        Error output example:
+        {
+            "error": "Azure OpenAI client not available"
+        }
         """
         logger.info("Generating monitoring report")
         if not self.is_available():
@@ -215,7 +302,7 @@ class AzureOpenAITools:
             
             # Send request to Azure OpenAI
             response = await self._client.chat.completions.create(
-                deployment_name="gpt-4",  # Adjust this to your deployment
+                deployment_name=self.deployment,
                 messages=prompt,
                 temperature=0.5,
                 max_tokens=1500

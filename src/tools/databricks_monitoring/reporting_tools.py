@@ -17,15 +17,69 @@ def final_report(
     fix_successful: Optional[bool] = None
 ) -> str:
     """
-    Generate a final report for the monitoring run.
+    Generates a comprehensive, formatted Markdown report summarizing the monitoring and remediation process.
     
-    Args:
-        issue_type: The type of issue that was detected, if any
-        steps: The reasoning steps taken during monitoring
-        fix_successful: Whether the fix was successful, if applicable
-        
-    Returns:
-        A formatted report string
+    This tool creates a well-structured report documenting the entire issue investigation and 
+    resolution workflow, including:
+    - Issue summary with type classification
+    - Fix status and outcome
+    - Detailed steps with timestamps, results, and technical details
+    - Targeted recommendations based on issue type
+    
+    When to use:
+    - At the end of the monitoring and remediation process
+    - To document what was found and what actions were taken
+    - To provide stakeholders with a clear summary and next steps
+    
+    Input JSON example:
+    {
+        "issue_type": "memory_exceeded",       // Optional: Type of issue detected, null if none
+        "steps": [                             // Required: List of steps taken during monitoring
+            {
+                "step": "log_collection",
+                "timestamp": 1625176800,
+                "result": "Collected logs from job run 987654",
+                "details": "Retrieved 2.5MB of log data",
+                "attempt": 1
+            },
+            {
+                "step": "diagnosis",
+                "timestamp": 1625176830,
+                "result": "Identified memory issue",
+                "details": "Found OutOfMemoryError in stderr logs"
+            },
+            {
+                "step": "fix_suggestion",
+                "timestamp": 1625176860,
+                "result": "Suggested memory increase",
+                "parameters": {
+                    "memory_increment": "50%"
+                }
+            },
+            {
+                "step": "fix_application",
+                "timestamp": 1625176900,
+                "result": "Applied memory increase",
+                "details": "Resized cluster to increase memory allocation"
+            },
+            {
+                "step": "verification",
+                "timestamp": 1625177000,
+                "result": "Fix verified successful",
+                "details": "Job completed successfully with increased memory"
+            }
+        ],
+        "fix_successful": true                // Optional: Whether the fix was successful, null if no fix attempted
+    }
+    
+    Output example:
+    A formatted Markdown string containing the full report with sections:
+    - Header with timestamp
+    - Issue Summary section
+    - Resolution Status section
+    - Monitoring Steps section (with details for each step)
+    - Recommendations section (tailored to the issue type)
+    - Footer
     """
     logger.info("Generating final report")
     
@@ -103,7 +157,7 @@ def final_report(
                 if "self_harm_score" in safety:
                     report += f"- Self-harm content score: {safety['self_harm_score']}\n"
                 report += "\n"
-    else:
+            else:
                 report += "✅ **Safety Check:** No issues detected\n\n"
         
         # Add guardrail trigger information if present

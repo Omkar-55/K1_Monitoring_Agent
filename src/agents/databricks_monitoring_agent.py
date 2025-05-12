@@ -1,8 +1,8 @@
 """
-Databricks Monitoring Agent for the K1 Monitoring Agent platform.
+Databricks Monitoring Agent for the Monitoring Agent platform.
 
 This agent collects logs from Databricks workspaces, analyzes issues,
-suggests and implements fixes, and verifies resolutions.
+suggests fixes, waits for the human approval, implements fixes, verifies resolutions and updates the user of the summary
 """
 
 import os
@@ -129,7 +129,7 @@ class MonitoringResponse(BaseModel):
 class DatabricksMonitoringAgent:
     """
     Agent for monitoring Databricks workspaces, detecting issues,
-    and automatically applying fixes.
+    applying fixes after human approval, and generating a summary for the user
     """
     
     def __init__(self):
@@ -166,7 +166,7 @@ class DatabricksMonitoringAgent:
     ) -> GuardrailFunctionOutput:
         """
         Input guardrail to validate that incoming requests are appropriate for this agent.
-        Prevents non-Databricks related queries and potential harmful content.
+        Prevents job monitoring related queries and potential harmful content.
         
         Args:
             ctx: The run context
@@ -201,7 +201,7 @@ class DatabricksMonitoringAgent:
         # Check for non-Databricks related queries using the assistant
         if self.assistant:
             prompt = f"""
-            Is this query related to Databricks monitoring, diagnostics, or fixes?
+            Is this query related to Jobs, Pieplines or Clusters monitoring, diagnostics, or fixes?
             Query: "{input}"
             
             Answer only 'yes' or 'no' and provide a brief reason.
@@ -372,13 +372,131 @@ class DatabricksMonitoringAgent:
             name="Databricks Monitoring Assistant",
             task=AgentTask.WORKSPACE_MANAGEMENT,
             actions=actions,
-            model=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4"),
-            system_message="""You are a Databricks monitoring agent that helps diagnose and fix issues in Databricks workspaces. 
-            You will analyze logs, suggest fixes, implement them, and verify if they resolve the issues.
-            Be thorough in your analysis, and explain your reasoning at each step.
-            Always verify that your suggestions are safe before applying them.""",
-            input_guardrails=[self.validate_input],
-            output_guardrails=[self.validate_output]
+            model=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1"),
+            system_message="""You are a **Databricks Support Engineer** agent (using GPT-4.1) whose mission is to:
+
+            1. **Diagnose** Databricks pipelines/jobs  
+            2. **Analyze** and **pull logs** using Databricks tools  
+            3. **Propose** and—upon user approval—**apply fixes**  
+            4. **Verify** that fixes resolve the issue  
+            5. **Answer** user queries about pipeline/job status  
+
+            > **Important:**  
+            > - Only end your turn once you're certain the user's problem or query is fully resolved.  
+            > - Be thorough and explain your reasoning **step by step**.  
+            > - **Do not guess**—use tools to inspect logs or config.  
+
+
+
+            ---
+
+            ## High-Level Strategy
+
+            1. **Understand**  
+            - Read the user's query carefully.  
+            - Clarify ambiguities by asking follow-up questions if needed.  
+
+            2. **Gather Context**  
+            - Use Databricks APIs/tools to **pull logs**, workspace metadata, job configurations, etc.  
+
+            3. **Root Cause Analysis**  
+            - Read logs, error messages, and config.  
+            - Identify whether the issue stems from OOM, cluster limits, timeouts, dependencies, permissions, etc.  
+
+            4. **Plan**  
+            - Break the fix into **small, verifiable steps**.  
+            - Outline each step before acting.  
+
+            5. **Execute**  
+            - After user approval, apply patches or configuration changes.  
+            - If a patch fails to apply, retry or choose an alternative.  
+
+            6. **Verify & Test**  
+            - Re-run the pipeline/job after each change.  
+            - Confirm errors are resolved or iterate again.  
+
+            7. **Reflect & Summarize**  
+            - Once resolved, summarize:  
+                - Issue type & root cause  
+                - Steps you took  
+                - Confirmation that the fix worked  
+            - For **status-only** queries, simply report current pipeline/job health.  
+
+            ---
+
+            ## Diagnostic Workflow
+
+            - **When fixing:**  
+            1. Pull relevant logs.  
+            2. Analyze for root cause.  
+            3. Plan & seek user approval.  
+            4. Apply fix.  
+            5. Test & verify.  
+            6. Iterate until green.  
+
+            - **When monitoring:**  
+            1. Pull status/logs.  
+            2. Summarize current state.  
+            3. No fixes unless requested.  
+
+            ---
+
+            ## Reasoning & Tools
+
+            - **Plan thoroughly** before any function/tool call.  
+            - **Reflect** on every tool output—do not chain calls blindly.  
+            - **Ensure safety** of suggestions before applying.  
+
+            ---
+            If you are not sure about file content or codebase structure pertaining to the user's request, 
+            use your tools to read files and gather the relevant information: do NOT guess or make up an answer.
+
+            ---
+
+            ## **CONFLICTS & REDUNDANCIES**  
+            - **"You MUST iterate and keep going…"** appears twice—consolidated above.  
+            - "Only terminate your turn when you are sure…" was repeated—now single bullet.  
+            - "Pipeline and job mean the same." → **Removed**, since terminology is consistent now.  
+
+            ---
+
+            ## Examples
+
+            ### 1. Monitoring Status  
+            **User**: "What's the status of pipeline `daily_ingest_v2`?"  
+            **Agent**:  
+            1. Pulls the latest run logs/config via `get_pipeline_status('daily_ingest_v2')`.  
+            2. Summarizes: "Last run succeeded at 2025-05-11 02:15 UTC; no errors in recent logs. No further action needed."
+
+            ### 2. Diagnosing & Fixing  
+            **User**: "`customer_etl` is failing with an OOM error."  
+            **Agent**:  
+            1. **Plan**:  
+            - Pull job logs.  
+            - Check driver/executor memory usage.  
+            - Propose increasing cluster driver memory by 2 GB.  
+            2. **Log Analysis**:  
+            - Finds executor peaks at 14 GB / 12 GB limit.  
+            3. **User Approval**:  
+            - "I recommend bumping executor memory to 16 GB. Approve?"  
+            4. **Apply Fix**:  
+            - Calls `update_cluster_config(...)`.  
+            5. **Verify**:  
+            - Reruns pipeline; confirms success.  
+            6. **Summary**:  
+            - "Issue: OOM due to 12 GB executor limit; increased to 16 GB; pipeline now succeeds."
+
+            ---
+            You are an agent - please keep going until the user's query is completely resolved, before ending your turn and yielding back to the user. 
+            Only terminate your turn when you are sure that the problem is solved.
+            You MUST plan extensively before each function call, and reflect extensively on the outcomes of the previous function calls. 
+            DO NOT do this entire process by making function calls only, as this can impair your ability to solve the problem and think insightfully.
+
+
+            *End prompt.*
+            .""",
+            input_guardrails=[validate_input],
+            output_guardrails=[validate_output]
         )
         
         logger.info("Assistant configured with input and output guardrails")
@@ -410,8 +528,12 @@ class DatabricksMonitoringAgent:
             reasoning_step = {"step": "log_collection", "timestamp": time.time()}
             
             if request.simulate:
-                from src.tools.databricks_monitoring.diagnostic_tools import simulate_run
-                logs_data = simulate_run(failure_type=request.simulate_failure_type or "memory_exceeded")
+                logs_data = get_logs(
+                    request.job_id, 
+                    request.run_id, 
+                    simulate=True, 
+                    simulate_failure_type=request.simulate_failure_type or "memory_exceeded"
+                )
                 logger.info(f"Using simulated run data for failure type: {request.simulate_failure_type or 'memory_exceeded'}")
             else:
                 logs_data = get_logs(request.job_id, request.run_id)
@@ -619,21 +741,42 @@ class DatabricksMonitoringAgent:
     
         # Step 5: Verify the fix
         reasoning_step = {"step": "fix_verification", "timestamp": time.time(), "attempt": fix_attempts + 1}
+        reasoning_step["fix_id"] = approved_fix.get("fix_id")  # Track which fix is being verified
         
         # Verify the fix
         try:
-            verification_result = verify(request.job_id, response.run_id, simulate=request.simulate)
+            verification_result = verify(
+                job_id=request.job_id, 
+                run_id_or_fix_details={
+                    "run_id": response.run_id,
+                    "fix_type": approved_fix.get("fix_type"),
+                    "parameters": approved_fix.get("parameters", {}),
+                    "attempt": fix_attempts + 1
+                }, 
+                simulate=request.simulate
+            )
             
-            fix_status = FixStatus[verification_result.get("status", "FAILED").upper()]
+            # Process verification result
+            status = verification_result.get("status", "failed").upper()
+            success = verification_result.get("issue_resolved", False)
+            
+            try:
+                fix_status = FixStatus[status]
+            except KeyError:
+                # Handle case where status string doesn't match enum exactly
+                fix_status = FixStatus.SUCCESSFUL if success else FixStatus.FAILED
+            
+            # Update the response based on verification results
+            response.fix_successful = success
             
             reasoning_step["result"] = verification_result.get("message", "Fix verification completed")
             reasoning_step["details"] = verification_result.get("details", {})
             reasoning_step["status"] = fix_status.name
             response.reasoning.append(reasoning_step)
             
-            if fix_status == FixStatus.SUCCESSFUL:
+            # Generate final report if the fix was successful
+            if success:
                 logger.info(f"Fix successful on attempt {fix_attempts + 1}")
-                response.fix_successful = True
                 
                 # Generate final report
                 try:
@@ -1026,7 +1169,7 @@ class DatabricksMonitoringAgent:
     async def _verify_fix_wrapper(self, job_id: str, run_id: str) -> str:
         """Wrapper for verify action."""
         try:
-            result = verify(job_id, run_id)
+            result = verify(job_id=job_id, run_id_or_fix_details=run_id)
             return json.dumps(result)
         except Exception as e:
             logger.error(f"Error in verify action: {e}", exc_info=True)

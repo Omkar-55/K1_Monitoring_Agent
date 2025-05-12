@@ -27,14 +27,44 @@ LIB_RE = r"Library resolution failed"
 
 def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Suggest a fix for a Databricks issue.
+    Analyzes Databricks issue data and proposes a solution based on the issue_type.
     
-    Args:
-        issue_type: The type of issue detected
-        logs_data: The logs data
-        
-    Returns:
-        A suggested fix
+    This tool examines the logs and issue diagnosis to generate a recommended fix,
+    along with parameters and user-friendly instructions for implementing it.
+    
+    When to use:
+    - After diagnosing an issue with the diagnose() tool
+    - When you need to determine appropriate configuration changes
+    - Before applying a fix to resolve the identified problem
+    
+    Input JSON example:
+    {
+        "issue_type": "memory_exceeded",
+        "logs_data": {
+            "stdout": "... log content from standard output ...",
+            "stderr": "... log content with error messages ...",
+            "run_info": {
+                "run_id": "123456",
+                "job_id": "7890",
+                "state": "FAILED"
+            }
+        }
+    }
+    
+    Output JSON example:
+    {
+        "fix_type": "increase_memory",
+        "parameters": {
+            "memory_increment": "50%",
+            "driver_memory": "True",
+            "executor_memory": "True"
+        },
+        "confidence": 0.8,
+        "description": "Increase cluster memory by 50%. Java heap space errors indicate that the current memory allocation is insufficient for processing the data volume.",
+        "required_permissions": ["cluster_edit", "pool_edit"],
+        "expected_impact": "This will increase resource consumption but should allow the job to complete successfully.",
+        "estimated_time": "5-10 minutes for cluster resize"
+    }
     """
     logger.info(f"Suggesting fix for issue: {issue_type}")
     
@@ -52,7 +82,7 @@ def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
     estimated_time = ""
     
     # Memory issues
-    if issue_type == FailureType.MEMORY_EXCEEDED:
+    if issue_type == FailureType.MEMORY_EXCEEDED.value:
         fix_type = "increase_memory"
         
         # Analyze logs to determine optimal memory increment
@@ -79,7 +109,7 @@ def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
         estimated_time = "5-10 minutes for cluster resize"
     
     # Disk space issues
-    elif issue_type == FailureType.DISK_SPACE_EXCEEDED:
+    elif issue_type == FailureType.DISK_SPACE_EXCEEDED.value:
         fix_type = "increase_disk_space"
         
         # Default parameters
@@ -99,7 +129,7 @@ def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
         estimated_time = "5-10 minutes for cluster resize"
     
     # Dependency issues
-    elif issue_type == FailureType.DEPENDENCY_ERROR:
+    elif issue_type == FailureType.DEPENDENCY_ERROR.value:
         fix_type = "install_dependencies"
         
         # Try to extract missing package names from the logs
@@ -144,61 +174,6 @@ def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
         expected_impact = "Installing dependencies will add libraries needed for the job execution."
         estimated_time = "10-15 minutes (includes cluster restart)"
     
-    # Quota exceeded issues
-    elif issue_type == FailureType.QUOTA_EXCEEDED:
-        fix_type = "reduce_cluster_size"
-        parameters = {
-            "reduction_factor": "0.5"  # Reduce by 50%
-        }
-        confidence = 0.7
-        
-        user_readable_description = (
-            "Reduce cluster size to stay within Azure quota limits. "
-            "The job is failing because it exceeded the available quota for the resource."
-        )
-        
-        required_permissions = ["cluster_edit"]
-        expected_impact = "This will allow the job to run with reduced resources, possibly extending execution time."
-        estimated_time = "5-10 minutes for cluster resize"
-    
-    # Timeout issues
-    elif issue_type == FailureType.TIMEOUT:
-        fix_type = "increase_timeouts"
-        parameters = {
-            "spark.network.timeout": "800s",
-            "spark.storage.blockManagerSlaveTimeoutMs": "600000",
-            "spark.executor.heartbeatInterval": "20s"
-        }
-        confidence = 0.75
-        
-        user_readable_description = (
-            "Increase network and RPC timeouts in Spark configuration. "
-            "The job is failing due to communication timeouts between components."
-        )
-        
-        required_permissions = ["cluster_edit"]
-        expected_impact = "This will allow for longer processing times before timeout, improving reliability for slower operations."
-        estimated_time = "5 minutes (requires cluster restart)"
-    
-    # Data skew issues
-    elif issue_type == FailureType.DATA_SKEW:
-        fix_type = "optimize_shuffle"
-        parameters = {
-            "spark.sql.adaptive.enabled": "true",
-            "spark.sql.adaptive.skewJoin.enabled": "true",
-            "spark.sql.shuffle.partitions": "200"
-        }
-        confidence = 0.8
-        
-        user_readable_description = (
-            "Enable adaptive query execution and skew join optimizations. "
-            "The job is experiencing data skew causing performance issues."
-        )
-        
-        required_permissions = ["cluster_edit"]
-        expected_impact = "This will allow Spark to better handle uneven data distribution, improving performance for skewed datasets."
-        estimated_time = "5 minutes (requires cluster restart)"
-    
     # Unknown issues - try a cluster restart
     else:
         fix_type = "restart_cluster"
@@ -231,17 +206,62 @@ def suggest_fix(issue_type: str, logs_data: Dict[str, Any]) -> Dict[str, Any]:
 def apply_fix(job_id: str, run_id: str, fix_type: str, parameters: Dict[str, Any], 
              simulate: bool = False) -> Dict[str, Any]:
     """
-    Apply a fix to a Databricks issue.
+    Applies the recommended fix to resolve a Databricks issue by modifying cluster configuration.
     
-    Args:
-        job_id: The Databricks job ID
-        run_id: The Databricks run ID
-        fix_type: The type of fix to apply
-        parameters: The fix parameters
-        simulate: Whether to simulate fix execution
-        
-    Returns:
-        Result of the fix application
+    This tool executes the necessary API calls to implement the suggested fix, such as
+    resizing clusters, adjusting configurations, installing libraries, or restarting services.
+    
+    When to use:
+    - After generating a fix recommendation with suggest_fix()
+    - When you're ready to implement changes to resolve an issue
+    - When you have appropriate permissions to modify Databricks resources
+    
+    Input JSON example:
+    {
+        "job_id": "123456",                // Required: Databricks job ID
+        "run_id": "987654",                // Required: Databricks run ID
+        "fix_type": "increase_memory",     // Required: Type of fix from suggest_fix()
+        "parameters": {                    // Required: Parameters from suggest_fix()
+            "memory_increment": "50%",
+            "driver_memory": "True",
+            "executor_memory": "True"
+        },
+        "simulate": false                  // Optional: Only simulate the fix (default: false)
+    }
+    
+    Output JSON example (success):
+    {
+        "status": "success",
+        "message": "Increased memory for cluster abc-123456 by 50%",
+        "details": {
+            "job_id": "123456",
+            "run_id": "987654",
+            "cluster_id": "abc-123456",
+            "fix_type": "increase_memory",
+            "parameters": {
+                "memory_increment": "50%",
+                "driver_memory": "True",
+                "executor_memory": "True"
+            },
+            "resize_result": {
+                "status": "success"
+            }
+        }
+    }
+    
+    Output JSON example (error):
+    {
+        "status": "error",
+        "message": "Error resizing cluster: Insufficient quota available",
+        "details": {
+            "job_id": "123456",
+            "run_id": "987654",
+            "fix_type": "increase_memory",
+            "parameters": {
+                "memory_increment": "50%"
+            }
+        }
+    }
     """
     logger.info(f"Applying fix {fix_type} to job {job_id}, run {run_id}")
     
@@ -308,11 +328,11 @@ def apply_fix(job_id: str, run_id: str, fix_type: str, parameters: Dict[str, Any
                 error_msg = f"Error resizing cluster: {resize_result.get('error')}"
                 logger.error(error_msg)
                 return {"status": "error", "message": error_msg}
-                
-                return {
+            
+            return {
                 "status": "success",
                 "message": f"Increased memory for cluster {cluster_id} by {memory_increment}",
-                    "details": {
+                "details": {
                     "job_id": job_id,
                     "run_id": run_id,
                     "cluster_id": cluster_id,
@@ -400,70 +420,6 @@ def apply_fix(job_id: str, run_id: str, fix_type: str, parameters: Dict[str, Any
                 }
             }
             
-        elif fix_type == "reduce_cluster_size":
-            # Get current cluster configuration
-            cluster_info = client.get_cluster_status(cluster_id)
-            
-            if "error" in cluster_info:
-                error_msg = f"Error getting cluster information: {cluster_info.get('error')}"
-                logger.error(error_msg)
-                return {"status": "error", "message": error_msg}
-            
-            # Calculate new size based on reduction factor
-            reduction_factor = float(parameters.get("reduction_factor", "0.5"))
-            current_workers = cluster_info.get("num_workers", 1)
-            new_workers = max(1, int(current_workers * reduction_factor))
-            
-            # Resize the cluster
-            resize_result = client.resize_cluster(cluster_id, new_workers)
-            
-            if "error" in resize_result:
-                error_msg = f"Error resizing cluster: {resize_result.get('error')}"
-                logger.error(error_msg)
-                return {"status": "error", "message": error_msg}
-                
-                return {
-                "status": "success",
-                "message": f"Reduced cluster size from {current_workers} to {new_workers} workers",
-                    "details": {
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "cluster_id": cluster_id,
-                    "fix_type": fix_type,
-                    "parameters": parameters,
-                    "resize_result": resize_result
-                }
-            }
-            
-        elif fix_type in ["increase_timeouts", "optimize_shuffle"]:
-            # Set Spark configuration parameters
-            spark_conf = parameters
-            
-            # Update cluster configuration
-            config_result = client.set_spark_conf(cluster_id, spark_conf)
-            
-            if "error" in config_result:
-                error_msg = f"Error updating Spark configuration: {config_result.get('error')}"
-                logger.error(error_msg)
-                return {"status": "error", "message": error_msg}
-            
-            # Restart to apply changes
-            restart_result = client.restart_cluster(cluster_id)
-            
-            return {
-                "status": "success",
-                "message": f"Updated Spark configuration and restarted cluster {cluster_id}",
-                "details": {
-                    "job_id": job_id,
-                    "run_id": run_id,
-                    "cluster_id": cluster_id,
-                    "fix_type": fix_type,
-                    "parameters": parameters,
-                    "config_result": config_result,
-                    "restart_result": restart_result
-                }
-            }
-            
         else:
             error_msg = f"Unsupported fix type: {fix_type}"
             logger.error(error_msg)
@@ -475,7 +431,7 @@ def apply_fix(job_id: str, run_id: str, fix_type: str, parameters: Dict[str, Any
         return {"status": "error", "message": error_msg}
     
     # This code should never be reached, but just in case
-        return {
+    return {
         "status": "error",
         "message": "Unknown error in fix application logic",
         "details": {
@@ -484,4 +440,4 @@ def apply_fix(job_id: str, run_id: str, fix_type: str, parameters: Dict[str, Any
             "fix_type": fix_type,
             "parameters": parameters
         }
-        } 
+    } 

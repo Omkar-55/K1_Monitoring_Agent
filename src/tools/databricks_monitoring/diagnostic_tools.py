@@ -1,466 +1,723 @@
 """
-Tools for diagnosing issues in Databricks logs.
+Tools for diagnostics and issue detection in Databricks jobs.
 """
 
-import random
-import time
-import json
 import os
 import re
+import json
+import time
+import random
 from enum import Enum
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 
-# Import the logging configuration
+# Import logging configuration
 from src.agent_core.logging_config import get_logger
-
-# Import the Databricks API client
-from src.tools.databricks_api_tools import DatabricksAPIClient
 
 # Get logger for this module
 logger = get_logger(__name__)
 
-# Regex patterns for issue detection
-OOM_RE = r"OutOfMemoryError|GC overhead limit exceeded"
-QUOTA_RE = r"AZURE_QUOTA_EXCEEDED_EXCEPTION|QuotaExceeded"
-TIMEOUT_RE = r"(Connection refused|RPC timed out|unreachable during run)"
-LIB_RE = r"Library resolution failed"
+# Regular expressions for common errors
+OOM_RE = r"java\.lang\.OutOfMemoryError|OutOfMemoryError|Memory limit exceeded|GC overhead limit exceeded|Container killed.*exceeding memory limits"
+DISK_RE = r"No space left on device|Disk quota exceeded|IOException.*space|DiskBlockManager.*disk write failed"
+DEP_RE = r"ClassNotFoundException|ModuleNotFoundError|ImportError|NoClassDefFoundError|Can\'t find resource file|library not loaded"
+QUOTA_RE = r"Quota exceeded|Resource limit exceeded|exceeded your quota"
+TIMEOUT_RE = r"Connection timed out|Read timed out|Socket timeout|Connection reset|unreachable"
+DATA_SKEW_RE = r"data skew|skewed data|imbalanced partitions"
 
-class FailureType(str, Enum):
-    """Types of failures that can be diagnosed."""
+class FailureType(Enum):
+    """Types of failures that can occur in Databricks jobs."""
     MEMORY_EXCEEDED = "memory_exceeded"
     DISK_SPACE_EXCEEDED = "disk_space_exceeded"
     DEPENDENCY_ERROR = "dependency_error"
-    QUOTA_EXCEEDED = "quota_exceeded"
-    TIMEOUT = "timeout"
-    DATA_SKEW = "data_skew"
     UNKNOWN = "unknown"
 
-async def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
+def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Analyzes Databricks logs to identify and diagnose job failures or performance issues.
+    
+    This tool uses a multi-layered approach to diagnose issues:
+    1. Pattern-based detection using regex for common errors
+    2. AI-powered analysis for complex or unclear errors
+    3. Correlation with cluster metadata and job configuration
+    
+    When to use:
+    - After collecting logs from a failed or problematic Databricks job
+    - To identify the root cause of a job failure
+    - To get contextual information about performance issues
+    
+    Input JSON example:
+    {
+        "stdout": "... log content from standard output ...",
+        "stderr": "... log content from standard error ...",
+        "run_id": "12345",
+        "job_id": "67890",
+        "status": "FAILED",
+        "duration_seconds": 3600,
+        "cluster_id": "cluster-98765"  // Optional
+    }
+    
+    Output JSON example:
+    {
+        "issue_type": "memory_exceeded",
+        "confidence": 0.85,
+        "evidence": [
+            "java.lang.OutOfMemoryError: Java heap space",
+            "Container killed by YARN for exceeding memory limits"
+        ],
+        "details": "The job failed due to insufficient memory allocation. Detected heap space errors and container termination.",
+        "recommendations": [
+            "Increase executor memory by at least 2GB",
+            "Optimize join operations to reduce memory pressure",
+            "Consider using disk spill for large operations"
+        ],
+        "cluster_context": {  // Optional, if available
+            "executor_memory": "4g",
+            "driver_memory": "8g",
+            "max_executors": 10
+        }
+    }
+    """
+    logger.info(f"Diagnosing logs for run {logs_data.get('run_id', 'unknown')}")
+    
+    # Use simulation if this is a simulated run
+    if logs_data.get("simulated", False):
+        logger.info("Simulated run detected, generating simulated diagnosis")
+        return _simulate_diagnosis(logs_data.get("simulate_failure_type"))
+    
+    # Determine which diagnostic method to use
+    use_ai = os.getenv("USE_AI_DIAGNOSIS", "true").lower() in ["true", "1", "yes"]
+    
+    # Try AI diagnosis first if enabled
+    if use_ai:
+        try:
+            logger.info("Attempting AI-based diagnosis")
+            ai_diagnosis = diagnose_with_ai(logs_data)
+            
+            # Check confidence threshold
+            if ai_diagnosis.get("confidence", 0) >= 0.6:
+                logger.info(f"AI diagnosis successful with confidence {ai_diagnosis.get('confidence')}")
+                return ai_diagnosis
+            else:
+                logger.info(f"AI diagnosis confidence too low ({ai_diagnosis.get('confidence')}), falling back to pattern matching")
+        except Exception as e:
+            logger.warning(f"AI diagnosis failed: {e}, falling back to pattern matching")
+    
+    # Fall back to pattern matching
+    logger.info("Using pattern matching for diagnosis")
+    return diagnose_pattern_matching(logs_data)
+
+def _extract_issue_type_from_text(text: str) -> FailureType:
+    """
+    Extract issue type from text analysis.
+    
+    Args:
+        text: The text to analyze
+        
+    Returns:
+        The failure type
+    """
+    text_lower = text.lower()
+    
+    if re.search(OOM_RE, text_lower, re.IGNORECASE) or "memory" in text_lower:
+        return FailureType.MEMORY_EXCEEDED
+    elif re.search(DISK_RE, text_lower, re.IGNORECASE) or "disk" in text_lower:
+        return FailureType.DISK_SPACE_EXCEEDED
+    elif re.search(DEP_RE, text_lower, re.IGNORECASE) or "dependency" in text_lower:
+        return FailureType.DEPENDENCY_ERROR
+    else:
+        return FailureType.UNKNOWN
+
+def _basic_diagnosis(stdout: str, stderr: str) -> Dict[str, Any]:
+    """
+    Perform a basic diagnosis using pattern matching.
+    
+    Args:
+        stdout: Standard output logs
+        stderr: Standard error logs
+        
+    Returns:
+        Dictionary with diagnosis results
+    """
+    # Combine logs
+    combined_logs = f"{stdout}\n{stderr}"
+    
+    # Check for memory issues
+    if re.search(OOM_RE, combined_logs, re.IGNORECASE):
+        return {
+            "issue_type": FailureType.MEMORY_EXCEEDED.value,
+            "confidence": 0.7,
+            "evidence": ["Out of memory error detected in logs"],
+            "details": "Memory limit exceeded"
+        }
+    
+    # Check for disk issues
+    if re.search(DISK_RE, combined_logs, re.IGNORECASE):
+        return {
+            "issue_type": FailureType.DISK_SPACE_EXCEEDED.value,
+            "confidence": 0.7,
+            "evidence": ["Disk space error detected in logs"],
+            "details": "Disk space limit exceeded"
+        }
+    
+    # Check for dependency issues
+    if re.search(DEP_RE, combined_logs, re.IGNORECASE):
+        return {
+            "issue_type": FailureType.DEPENDENCY_ERROR.value,
+            "confidence": 0.7,
+            "evidence": ["Dependency error detected in logs"],
+            "details": "Missing dependencies"
+        }
+    
+    # Unknown issue
+    return {
+        "issue_type": FailureType.UNKNOWN.value,
+        "confidence": 0.3,
+        "evidence": [],
+        "details": "Could not determine issue type from logs"
+    }
+
+def diagnose_with_ai(logs_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Diagnose issues in Databricks logs using Azure OpenAI.
     
     Args:
-        logs_data: The logs data to analyze
+        logs_data: Dictionary containing log data
         
     Returns:
-        A diagnosis result with issue_type and reasoning
+        Dictionary with diagnosis results
     """
-    logger.info("Diagnosing Databricks logs with AI")
+    logger.info("Using AI to diagnose logs")
+    
+    # Extract logs
+    stdout = logs_data.get("stdout", "")
+    stderr = logs_data.get("stderr", "")
+    
+    # Limit log size to avoid token limits
+    stdout = stdout[-5000:] if len(stdout) > 5000 else stdout
+    stderr = stderr[-10000:] if len(stderr) > 10000 else stderr
+    
+    # Get Azure OpenAI credentials
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
+    
+    if not api_key or not endpoint:
+        logger.warning("Azure OpenAI credentials not available")
+        return _basic_diagnosis(stdout, stderr)
     
     try:
-        # Import Azure OpenAI package
-        from azure.openai import AsyncAzureOpenAI
+        from openai import AzureOpenAI
         
-        # Setup OpenAI client
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
-        
-        if not api_key or not endpoint:
-            logger.warning("Azure OpenAI credentials not available, falling back to pattern matching")
-            return diagnose_pattern_matching(logs_data)
-            
-        # Initialize the client
-        client = AsyncAzureOpenAI(
+        # Create OpenAI client
+        client = AzureOpenAI(
+            azure_endpoint=endpoint,
             api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=endpoint
+            api_version=api_version
         )
         
-        # Extract the logs
-        logs = logs_data.get("logs", {})
-        stdout = logs.get("stdout", "")
-        stderr = logs.get("stderr", "")
+        # Prepare prompt
+        prompt = f"""
+        Analyze the following Databricks job logs and identify the most likely type of issue.
         
-        # Create the system and user messages
-        system_message = """You are a Databricks diagnostic expert. Your task is to analyze logs from Databricks 
-        jobs and identify the root cause of issues. Categorize the issue into one of these specific types:
-        1. memory_exceeded - When there are memory-related errors (OutOfMemoryError, GC overhead limit exceeded)
-        2. disk_space_exceeded - When there are disk space issues (No space left on device)
-        3. dependency_error - When there are missing packages or libraries (ModuleNotFoundError, ClassNotFoundException)
-        4. quota_exceeded - When Azure quota limits are hit (AZURE_QUOTA_EXCEEDED_EXCEPTION, QuotaExceeded)
-        5. timeout - When connections time out (Connection refused, RPC timed out, unreachable during run)
-        6. data_skew - When data skew causes performance issues
-        7. unknown - When the issue doesn't fit into the above categories
-        
-        Provide your analysis with a specific issue_type and detailed reasoning."""
-        
-        user_message = f"""Analyze these Databricks job logs:
-        
-        STDOUT:
-        {stdout}
-        
-        STDERR:
+        STDERR LOGS:
         {stderr}
         
-        Status: {logs_data.get('status', 'UNKNOWN')}
+        STDOUT LOGS:
+        {stdout}
         
-        Identify the issue type and explain your reasoning in detail.
+        I need to categorize the issue into one of these types:
+        1. memory_exceeded: Out of memory errors, heap space issues
+        2. disk_space_exceeded: No space left on device, disk quota issues
+        3. dependency_error: Missing dependencies, import errors, library issues
+        4. unknown: Can't determine from the logs
+        
+        Also tell me:
+        - The confidence in your diagnosis (0.0 to 1.0)
+        - Specific evidence from the logs that supports your diagnosis
+        - Likely root cause of the issue
+        
+        Return your analysis as a JSON object.
         """
         
-        # Get response from Azure OpenAI
-        response = await client.chat.completions.create(
-            deployment_name=deployment,
+        # Call the API without async (synchronous call in a synchronous function)
+        response = client.chat.completions.create(
+            model=deployment,
             messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_message}
+                {"role": "system", "content": "You are a Databricks diagnostics expert. Be concise and accurate."},
+                {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
-            max_tokens=1000
+            temperature=0.1,
+            max_tokens=800
         )
         
-        if not response.choices:
-            logger.error("No response from Azure OpenAI")
-            return diagnose_pattern_matching(logs_data)
+        try:
+            # Try to parse JSON from the response
+            content = response.choices[0].message.content
+            result = json.loads(content)
             
-        analysis_text = response.choices[0].message.content
-        
-        # Extract the issue type from the response
-        issue_type = extract_issue_type(analysis_text)
-        
-        logger.info(f"AI diagnosed issue: {issue_type}")
+            # Extract the diagnosis
+            issue_type = result.get("issue_type", "unknown")
+            confidence = result.get("confidence", 0.5)
+            evidence = result.get("evidence", [])
+            root_cause = result.get("root_cause", "Unknown")
+            
+            logger.info(f"AI diagnosis complete: {issue_type} (confidence: {confidence})")
+            
+            # Convert to standard format
+            return {
+                "issue_type": issue_type,
+                "confidence": confidence,
+                "evidence": evidence,
+                "details": root_cause
+            }
+        except json.JSONDecodeError:
+            # If can't parse JSON, try to extract insights directly
+            content = response.choices[0].message.content
+            issue_type = _extract_issue_type_from_text(content)
+            
+            logger.warning(f"Couldn't parse JSON response, extracted issue type: {issue_type}")
         
         return {
-            "issue_type": issue_type,
-            "reasoning": analysis_text,
-            "logs_analyzed": {
-                "stdout_length": len(stdout),
-                "stderr_length": len(stderr)
-            },
-            "method": "ai"
-        }
-        
+                "issue_type": issue_type.value,
+                "confidence": 0.6,
+                "evidence": [],
+                "details": "Extracted from AI analysis text"
+            }
+            
+    except ImportError:
+        logger.warning("OpenAI package not available")
+        return _basic_diagnosis(stdout, stderr)
     except Exception as e:
-        logger.error(f"Error using AI for diagnosis: {e}", exc_info=True)
-        logger.warning("Falling back to pattern matching diagnosis")
-        return diagnose_pattern_matching(logs_data)
+        logger.error(f"Error in AI diagnosis: {e}")
+        return _basic_diagnosis(stdout, stderr)
 
 def extract_issue_type(text: str) -> str:
-    """Extract issue type from AI analysis text."""
-    text_lower = text.lower()
-    
-    if "issue_type" in text_lower and ":" in text_lower:
-        # Try to extract explicit issue_type field
-        for line in text_lower.split('\n'):
-            if "issue_type" in line and ":" in line:
-                value = line.split(":", 1)[1].strip()
-                for issue_type in FailureType:
-                    if issue_type.value in value:
-                        return issue_type.value
-    
-    # If no explicit issue_type field, infer from content
-    if re.search(OOM_RE, text_lower, re.IGNORECASE) or ("memory" in text_lower and ("error" in text_lower or "exceed" in text_lower)):
-        return FailureType.MEMORY_EXCEEDED
-    elif "disk" in text_lower and ("space" in text_lower or "quota" in text_lower):
-        return FailureType.DISK_SPACE_EXCEEDED
-    elif any(term in text_lower for term in ["dependency", "module", "package", "import", "library"]) or re.search(LIB_RE, text_lower, re.IGNORECASE):
-        return FailureType.DEPENDENCY_ERROR
-    elif re.search(QUOTA_RE, text_lower, re.IGNORECASE):
-        return FailureType.QUOTA_EXCEEDED
-    elif re.search(TIMEOUT_RE, text_lower, re.IGNORECASE):
-        return FailureType.TIMEOUT
-    elif "skew" in text_lower or "imbalance" in text_lower:
-        return FailureType.DATA_SKEW
-    else:
-        return FailureType.UNKNOWN
-
-def diagnose_pattern_matching(logs_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Diagnose issues in Databricks logs using pattern matching.
-    This is the fallback method when AI is not available.
+    Extract the issue type from AI analysis.
     
     Args:
-        logs_data: The logs data to analyze
+        text: The AI analysis text
         
     Returns:
-        A diagnosis result with issue_type and reasoning
+        The issue type as a string
     """
+    # Convert to lowercase for easier matching
+    text_lower = text.lower()
+    
+    # Check for memory issues
+    if "memory" in text_lower and any(term in text_lower for term in ["oom", "out of memory", "heap space"]) or re.search(OOM_RE, text_lower, re.IGNORECASE):
+        return FailureType.MEMORY_EXCEEDED.value
+    elif "disk" in text_lower and ("space" in text_lower or "quota" in text_lower):
+        return FailureType.DISK_SPACE_EXCEEDED.value
+    elif any(term in text_lower for term in ["dependency", "module", "package", "import", "library"]) or re.search(DEP_RE, text_lower, re.IGNORECASE):
+        return FailureType.DEPENDENCY_ERROR.value
+    elif re.search(QUOTA_RE, text_lower, re.IGNORECASE):
+        return FailureType.UNKNOWN.value
+    elif re.search(TIMEOUT_RE, text_lower, re.IGNORECASE):
+        return FailureType.UNKNOWN.value
+    elif "skew" in text_lower or "imbalance" in text_lower:
+        return FailureType.UNKNOWN.value
+    else:
+        return FailureType.UNKNOWN.value
+
+def diagnose_pattern_matching(logs_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Diagnose using pattern matching."""
     logger.info("Diagnosing Databricks logs using pattern matching")
     
-    # Extract the logs
-    logs = logs_data.get("logs", {})
-    stdout = logs.get("stdout", "")
-    stderr = logs.get("stderr", "")
+    # Extract logs
+    stdout = logs_data.get("stdout", "")
+    stderr = logs_data.get("stderr", "")
     
-    # Check for memory issues using regex
-    if re.search(OOM_RE, stderr, re.IGNORECASE):
+    # Default diagnosis
+    issue_type = FailureType.UNKNOWN
+    reasoning = "Could not determine the issue from logs"
+    confidence = 0.3
+    
+    # Check for memory issues (highest priority)
+    if "OutOfMemoryError" in stderr or "GC overhead limit exceeded" in stderr or re.search(OOM_RE, stderr, re.IGNORECASE):
         issue_type = FailureType.MEMORY_EXCEEDED
-        reasoning = "Job failed due to insufficient memory. Found OutOfMemoryError in logs."
+        reasoning = "Job failed due to memory issues. Found OutOfMemoryError or GC overhead limit exceeded in logs."
+        confidence = 0.8
     
     # Check for disk space issues
-    elif "No space left on device" in stderr or "Disk quota exceeded" in stderr:
+    elif "No space left on device" in stderr or "Disk quota exceeded" in stderr or re.search(DISK_RE, stderr, re.IGNORECASE):
         issue_type = FailureType.DISK_SPACE_EXCEEDED
-        reasoning = "Job failed due to insufficient disk space. Found disk space error in logs."
+        reasoning = "Job failed due to disk space issues. Found 'No space left on device' or similar in logs."
+        confidence = 0.8
     
     # Check for dependency issues
-    elif "ModuleNotFoundError" in stderr or "ImportError" in stderr or "ClassNotFoundException" in stderr or re.search(LIB_RE, stderr, re.IGNORECASE):
+    elif "ModuleNotFoundError" in stderr or "ImportError" in stderr or "ClassNotFoundException" in stderr or re.search(DEP_RE, stderr, re.IGNORECASE):
         issue_type = FailureType.DEPENDENCY_ERROR
         reasoning = "Job failed due to missing dependencies. Found import or module errors in logs."
+        confidence = 0.8
     
     # Check for quota issues
     elif re.search(QUOTA_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.QUOTA_EXCEEDED
-        reasoning = "Job failed due to Azure quota limits being exceeded."
+        issue_type = FailureType.UNKNOWN
+        reasoning = "Job failed due to unknown quota issues."
+        confidence = 0.7
     
     # Check for timeout issues
     elif re.search(TIMEOUT_RE, stderr, re.IGNORECASE):
-        issue_type = FailureType.TIMEOUT
-        reasoning = "Job failed due to connection timeouts or unreachable components."
-    
-    # Unknown issue
-    else:
         issue_type = FailureType.UNKNOWN
-        reasoning = "Could not identify a specific issue type from the logs."
+        reasoning = "Job failed due to connection timeouts or unreachable components."
+        confidence = 0.7
     
-    logger.info(f"Pattern matching diagnosed issue: {issue_type}")
-    
-    return {
-        "issue_type": issue_type,
-        "reasoning": reasoning,
-        "logs_analyzed": {
-            "stdout_length": len(stdout),
-            "stderr_length": len(stderr)
-        },
-        "method": "pattern_matching"
-    }
-
-def diagnose_with_metrics(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Enhance diagnosis with cluster metrics if available.
-    
-    Args:
-        logs_data: The logs data to analyze
-        cluster_id: Optional cluster ID to fetch metrics for
+    # If nothing specific found, try to gather some metrics for further analysis
+    elif "Exception" in stderr or "Error" in stderr:
+        issue_type = FailureType.UNKNOWN
+        reasoning = "Job failed with an exception, but could not determine the specific cause."
+        confidence = 0.4
         
-    Returns:
-        Enhanced diagnosis with metrics
-    """
-    # First do basic diagnosis
-    basic_diagnosis = diagnose_pattern_matching(logs_data)
-    issue_type = basic_diagnosis["issue_type"]
-    
-    # If we have a cluster ID, try to fetch metrics
-    if cluster_id:
+        # Extract some metrics if available
         try:
-            # Create Databricks API client
-            client = DatabricksAPIClient()
+            # Extract memory usage metrics if available
+            metrics = {}
+            worker_mems = []
             
-            # Get cluster metrics
-            metrics = client.get_cluster_metrics(cluster_id)
-            
-            if metrics.get("status") == "success":
-                # Look for specific metrics that might indicate issues
-                memory_metrics = metrics.get("metrics", {}).get("memory", {})
+            # Memory pattern: "Worker X: Y% memory used"
+            mem_pattern = r"Worker \d+: (\d+)% memory used"
+            for match in re.finditer(mem_pattern, stdout):
+                worker_mems.append(float(match.group(1)))
                 
-                # Check for memory pressure
-                driver_mem = memory_metrics.get("driver", {}).get("used_percent", 0)
-                worker_mems = [w.get("used_percent", 0) for w in memory_metrics.get("workers", [])]
-                
-                if driver_mem > 90 or any(mem > 90 for mem in worker_mems):
-                    # Confirm or update memory diagnosis
-                    issue_type = FailureType.MEMORY_EXCEEDED
-                    enhanced_reasoning = (
-                        f"High memory usage detected: Driver at {driver_mem:.1f}%, "
-                        f"Workers max at {max(worker_mems) if worker_mems else 0:.1f}%. "
-                        f"This confirms memory pressure as the likely cause."
-                    )
-                    
-                    # Add metrics to the diagnosis
-                    return {
-                        **basic_diagnosis,
-                        "issue_type": issue_type,
-                        "reasoning": enhanced_reasoning,
-                        "metrics": metrics.get("metrics"),
-                        "method": "metrics_enhanced"
-                    }
+            if worker_mems:
+                metrics["worker_memory_usage"] = {
+                    "min": min(worker_mems),
+                    "max": max(worker_mems),
+                    "avg": sum(worker_mems) / len(worker_mems)
+                }
                     
                 # Check for potential data skew if timeout or unknown issue
-                if issue_type in [FailureType.TIMEOUT, FailureType.UNKNOWN]:
+                if issue_type in [FailureType.UNKNOWN]:
                     # Check for imbalanced worker memory usage
                     if worker_mems and max(worker_mems) > 2 * min(worker_mems) and max(worker_mems) > 75:
-                        return {
-                            **basic_diagnosis,
-                            "issue_type": FailureType.DATA_SKEW,
-                            "reasoning": f"Potential data skew detected. Worker memory usage varies widely from {min(worker_mems):.1f}% to {max(worker_mems):.1f}%, suggesting imbalanced data processing.",
-                            "metrics": metrics.get("metrics"),
-                            "method": "metrics_enhanced"
-                        }
-                
-                # Add metrics to the diagnosis even if they don't change the issue type
-                return {
-                    **basic_diagnosis,
-                    "metrics": metrics.get("metrics"),
-                    "method": "metrics_enhanced"
-                }
+                        issue_type = FailureType.UNKNOWN
+                        reasoning = f"Potential data skew detected. Worker memory usage varies widely from {min(worker_mems):.1f}% to {max(worker_mems):.1f}%, suggesting imbalanced data processing."
+                        confidence = 0.6
         except Exception as e:
-            logger.error(f"Error fetching metrics for diagnosis: {e}", exc_info=True)
+            logger.warning(f"Error extracting metrics: {e}")
     
-    # Return basic diagnosis if no metrics available
-    return basic_diagnosis
-
-def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Diagnose issues in Databricks logs.
-    This function now attempts to use AI first, then falls back to pattern matching.
-    If cluster_id is provided, it will also attempt to enhance the diagnosis with metrics.
-    
-    Args:
-        logs_data: The logs data to analyze
-        cluster_id: Optional cluster ID to get metrics for
-        
-    Returns:
-        A diagnosis result with issue_type and reasoning
-    """
-    import asyncio
-    
-    try:
-        # Try to diagnose with AI
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        # If no event loop is set, create a new one
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-    try:
-        # Use AI diagnosis if possible
-        ai_diagnosis = loop.run_until_complete(diagnose_with_ai(logs_data))
-        
-        # If cluster_id is provided, try to enhance with metrics
-        if cluster_id:
-            return enhance_with_metrics(ai_diagnosis, cluster_id)
-        
-        return ai_diagnosis
-    except Exception as e:
-        logger.error(f"Error in AI diagnosis: {e}", exc_info=True)
-        
-        # Fall back to pattern matching with metrics if possible
-        if cluster_id:
-            return diagnose_with_metrics(logs_data, cluster_id)
-        
-        # Fall back to simple pattern matching
-        return diagnose_pattern_matching(logs_data)
-
-def enhance_with_metrics(diagnosis: Dict[str, Any], cluster_id: str) -> Dict[str, Any]:
-    """
-    Enhance an existing diagnosis with cluster metrics.
-    
-    Args:
-        diagnosis: The existing diagnosis
-        cluster_id: Cluster ID to get metrics for
-        
-    Returns:
-        Enhanced diagnosis with metrics
-    """
-    try:
-        # Create Databricks API client
-        client = DatabricksAPIClient()
-        
-        # Get cluster metrics
-        metrics = client.get_cluster_metrics(cluster_id)
-        
-        if metrics.get("status") == "success":
-            # Add metrics to the diagnosis
-            diagnosis["metrics"] = metrics.get("metrics")
-            diagnosis["method"] = f"{diagnosis.get('method', 'unknown')}_with_metrics"
-    except Exception as e:
-        logger.error(f"Error enhancing diagnosis with metrics: {e}", exc_info=True)
-    
-    return diagnosis
-
-def simulate_run(failure_type: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Generate simulated logs for testing.
-    
-    Args:
-        failure_type: The type of failure to simulate
-        
-    Returns:
-        Simulated logs data
-    """
-    logger.info(f"Simulating run with failure type: {failure_type}")
-    
-    # Generate a random run ID
-    run_id = f"run_{random.randint(10000, 99999)}"
-    job_id = f"job_{random.randint(1000, 9999)}"
-    
-    # Default to a random failure type if none specified
-    if not failure_type:
-        failure_types = list(FailureType)
-        failure_type = random.choice(failure_types)
-    
-    # Ensure failure_type is a string
-    if isinstance(failure_type, FailureType):
-        failure_type = failure_type.value
-    
-    # Generate appropriate logs for the failure type
-    stdout = "Starting Databricks job execution...\n"
-    stdout += "Loading data...\n"
-    stdout += "Processing data...\n"
-    
-    stderr = ""
-    
-    if failure_type == FailureType.MEMORY_EXCEEDED:
-        stdout += "Processing large dataset...\n"
-        stderr += "WARNING: Memory usage is high\n"
-        stderr += "ERROR: java.lang.OutOfMemoryError: Java heap space\n"
-        stderr += "  at org.apache.spark.sql.execution.aggregate.HashAggregateExec.doExecute(HashAggregateExec.scala:115)\n"
-        stderr += "  at org.apache.spark.sql.execution.SparkPlan.execute(SparkPlan.scala:180)\n"
-    
-    elif failure_type == FailureType.DISK_SPACE_EXCEEDED:
-        stdout += "Writing results to disk...\n"
-        stderr += "WARNING: Disk usage is high\n"
-        stderr += "ERROR: java.io.IOException: No space left on device\n"
-        stderr += "  at java.io.FileOutputStream.writeBytes(Native Method)\n"
-        stderr += "  at java.io.FileOutputStream.write(FileOutputStream.java:326)\n"
-    
-    elif failure_type == FailureType.DEPENDENCY_ERROR:
-        stdout += "Importing libraries...\n"
-        stderr += "ERROR: ModuleNotFoundError: No module named 'pandas'\n"
-        stderr += "  at <frozen importlib._bootstrap>(219)._call_with_frames_removed\n"
-        stderr += "  at <frozen importlib._bootstrap_external>(728).exec_module\n"
-        stderr += "Library resolution failed"
-    
-    elif failure_type == FailureType.QUOTA_EXCEEDED:
-        stdout += "Allocating Azure resources...\n"
-        stderr += "ERROR: AZURE_QUOTA_EXCEEDED_EXCEPTION: Azure quota exceeded\n"
-        stderr += "  at com.microsoft.azure.databricks.quota.QuotaManager.allocateResource\n"
-        
-    elif failure_type == FailureType.TIMEOUT:
-        stdout += "Connecting to remote service...\n"
-        stderr += "WARNING: Connection attempt timed out\n"
-        stderr += "ERROR: RPC timed out after 60000 ms\n"
-        stderr += "  at org.apache.spark.rpc.RpcTimeout.org$apache$spark$rpc$RpcTimeout\n"
-        
-    elif failure_type == FailureType.DATA_SKEW:
-        stdout += "Executing join operation...\n"
-        stdout += "Stage 3: [====>                                                ] 5/42 tasks\n"
-        stderr += "WARNING: Possible skew in join detected. Partition 3 has 10x more data.\n"
-        stderr += "  at org.apache.spark.sql.execution.ShuffledHashJoinExec.doExecute\n"
-    
-    else:
-        stdout += "Executing job...\n"
-        stderr += "ERROR: Unknown error occurred\n"
-        stderr += "  at com.databricks.backend.common.rpc.InternalDriverConnectionProvider.lambda$getOrCreate$1(InternalDriverConnectionProvider.scala:102)\n"
-    
-    # Simulate job status
-    status = "FAILED"
-    
-    # Simulate run duration
-    duration_seconds = random.randint(60, 3600)
-    
-    # Return the simulated logs
-    logs_data = {
-        "run_id": run_id,
-        "job_id": job_id,
-        "status": status,
-        "duration_seconds": duration_seconds,
-        "logs": {
-            "stdout": stdout,
-            "stderr": stderr
-        }
+    # Create the diagnosis result
+    basic_diagnosis = {
+        "issue_type": issue_type.value,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "method": "pattern_matching",
+        "evidence": []
     }
     
-    logger.info(f"Simulated run {run_id} with failure type {failure_type}")
+    # Extract evidence for the diagnosis
+    if "OutOfMemoryError" in stderr:
+        for line in stderr.split("\n"):
+            if "OutOfMemoryError" in line:
+                basic_diagnosis["evidence"].append(line.strip())
+                break
     
-    return logs_data 
+    # Add recommendations based on issue type
+    if issue_type == FailureType.MEMORY_EXCEEDED:
+        basic_diagnosis["recommendations"] = [
+            "Increase executor memory",
+            "Optimize join operations",
+            "Reduce shuffle partitions"
+        ]
+    elif issue_type == FailureType.DISK_SPACE_EXCEEDED:
+        basic_diagnosis["recommendations"] = [
+            "Clean up unused data files",
+            "Use more efficient storage formats"
+        ]
+    elif issue_type == FailureType.DEPENDENCY_ERROR:
+        basic_diagnosis["recommendations"] = [
+            "Install missing dependencies",
+            "Check library compatibility"
+        ]
+    else:
+        basic_diagnosis["recommendations"] = [
+            "Check logs for more details",
+            "Inspect job configuration"
+        ]
+    
+    logger.info(f"Pattern matching diagnosis complete: {issue_type.value} with confidence {confidence:.2f}")
+    return basic_diagnosis
+
+def _pattern_detection(stdout: str, stderr: str) -> Tuple[FailureType, float, List[str]]:
+    """
+    Detect issues based on pattern matching in logs.
+    
+    Args:
+        stdout: Standard output logs
+        stderr: Standard error logs
+        
+    Returns:
+        Tuple of (issue_type, confidence, evidence)
+    """
+    # Combine logs for analysis
+    combined_logs = f"{stdout}\n{stderr}"
+    evidence = []
+    
+    # Check for memory issues
+    oom_matches = re.findall(OOM_RE, combined_logs, re.IGNORECASE)
+    if oom_matches:
+        # Extract surrounding context for evidence
+        for match in oom_matches[:3]:  # Limit to first 3 matches
+            # Find the line containing the match
+            for line in combined_logs.splitlines():
+                if match in line:
+                    evidence.append(line.strip())
+                    break
+        
+        # Calculate confidence based on number and type of matches
+        confidence = min(0.6 + (len(oom_matches) * 0.1), 0.9)
+        return FailureType.MEMORY_EXCEEDED, confidence, evidence
+    
+    # Check for disk space issues
+    disk_matches = re.findall(DISK_RE, combined_logs, re.IGNORECASE)
+    if disk_matches:
+        for match in disk_matches[:3]:
+            for line in combined_logs.splitlines():
+                if match in line:
+                    evidence.append(line.strip())
+                    break
+        
+        confidence = min(0.6 + (len(disk_matches) * 0.1), 0.9)
+        return FailureType.DISK_SPACE_EXCEEDED, confidence, evidence
+    
+    # Check for dependency issues
+    dep_matches = re.findall(DEP_RE, combined_logs, re.IGNORECASE)
+    if dep_matches:
+        for match in dep_matches[:3]:
+            for line in combined_logs.splitlines():
+                if match in line:
+                    evidence.append(line.strip())
+                    break
+        
+        confidence = min(0.6 + (len(dep_matches) * 0.1), 0.9)
+        return FailureType.DEPENDENCY_ERROR, confidence, evidence
+    
+    # If no clear pattern, check for other common error indicators
+    if "error" in combined_logs.lower() or "exception" in combined_logs.lower():
+        # Extract some error lines as evidence
+        for line in combined_logs.splitlines():
+            if "error" in line.lower() or "exception" in line.lower():
+                evidence.append(line.strip())
+                if len(evidence) >= 3:
+                    break
+        
+        return FailureType.UNKNOWN, 0.4, evidence
+    
+    # No issues detected
+    return FailureType.UNKNOWN, 0.1, evidence
+
+def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any]:
+    """Simulate a diagnosis result for testing."""
+    logger.info(f"Simulating run with failure type: {failure_type_str}")
+    
+    if failure_type_str:
+        try:
+            failure_type = FailureType(failure_type_str)
+        except ValueError:
+            logger.warning(f"Invalid failure type: {failure_type_str}. Using random type.")
+            failure_type = random.choice(list(FailureType))
+    else:
+        failure_type = random.choice(list(FailureType))
+    
+    run_id = f"run_{int(time.time())}"
+    logger.info(f"Simulated run {run_id} with failure type: {failure_type.value}")
+    
+    # Detailed error logs for each failure type
+    if failure_type == FailureType.MEMORY_EXCEEDED:
+        # Choose one of several memory error patterns
+        memory_error_patterns = [
+            {
+                "error": "Java Heap Space Error",
+                "evidence": [
+                    "java.lang.OutOfMemoryError: Java heap space",
+                    "at org.apache.spark.sql.execution.joins.BroadcastHashJoinExec.executeBroadcast(BroadcastHashJoinExec.scala:163)",
+                    "at org.apache.spark.sql.execution.joins.BroadcastHashJoinExec.doExecuteBroadcast(BroadcastHashJoinExec.scala:98)"
+                ],
+                "details": "The JVM could not allocate more memory for objects due to heap space exhaustion during a join operation on large datasets."
+            },
+            {
+                "error": "Driver Out of Memory",
+                "evidence": [
+                    "ERROR JobProgressReporter: Exception while running job: Driver: Out of Memory",
+                    "org.apache.spark.SparkException: Job aborted due to stage failure: Total size of serialized results of 67 tasks (1024.0 MB) is bigger than spark.driver.maxResultSize (1024.0 MB)"
+                ],
+                "details": "The size of data being collected to the driver exceeded the configured limit during a collect() operation."
+            },
+            {
+                "error": "GC Overhead Limit Exceeded",
+                "evidence": [
+                    "java.lang.OutOfMemoryError: GC overhead limit exceeded",
+                    "at java.util.Arrays.copyOfRange(Arrays.java:3664)",
+                    "at java.lang.String.<init>(String.java:207)",
+                    "at org.apache.spark.sql.catalyst.expressions.GeneratedClass$GeneratedIteratorForCodegenStage1.processNext(Unknown Source)"
+                ],
+                "details": "The garbage collector is running almost continuously and recovering very little memory, indicating the system is spending too much time performing garbage collection with minimal progress."
+            },
+            {
+                "error": "ExecutorLostFailure due to Out of Memory",
+                "evidence": [
+                    "ERROR TaskSetManager: Lost executor 5 on 10.139.64.11: ExecutorLostFailure (executor 5 exited caused by one of the running tasks)",
+                    "Reason: Container killed by YARN for exceeding memory limits. 16.0 GB of 16 GB physical memory used.",
+                    "Consider boosting spark.yarn.executor.memoryOverhead."
+                ],
+                "details": "An executor was terminated because it exceeded its allocated memory, possibly due to data skew or insufficient memory allocation."
+            }
+        ]
+        
+        # Select one pattern randomly
+        selected_error = random.choice(memory_error_patterns)
+        
+        return {
+            "issue_type": failure_type.value,
+            "confidence": 0.85,
+            "evidence": selected_error["evidence"],
+            "details": selected_error["details"],
+            "recommendations": [
+                "Increase executor memory",
+                "Optimize join operations",
+                "Implement data partitioning to reduce memory pressure",
+                "Consider using disk spill for large operations"
+            ],
+            "cluster_context": {
+                "executor_memory": "4g",
+                "driver_memory": "8g",
+                "spark.memory.fraction": "0.6",
+                "spark.memory.storageFraction": "0.5"
+            },
+        }
+    elif failure_type == FailureType.DISK_SPACE_EXCEEDED:
+        # Different disk space error patterns
+        disk_error_patterns = [
+            {
+                "error": "No Space Left on Device",
+                "evidence": [
+                    "ERROR StorageManager: Error writing data to local disk",
+                    "java.io.IOException: No space left on device",
+                    "at java.io.FileOutputStream.writeBytes(Native Method)",
+                    "at org.apache.spark.storage.DiskBlockObjectWriter.write(DiskBlockObjectWriter.scala:233)"
+                ],
+                "details": "The job ran out of disk space while writing shuffle data to local storage."
+            },
+            {
+                "error": "Disk Quota Exceeded",
+                "evidence": [
+                    "java.io.IOException: Disk quota exceeded",
+                    "at java.io.UnixFileSystem.createFileExclusively(Native Method)",
+                    "at org.apache.hadoop.fs.RawLocalFileSystem.create(RawLocalFileSystem.java:297)"
+                ],
+                "details": "The job exceeded the available disk quota when writing output files."
+            },
+            {
+                "error": "Storage Directory Full",
+                "evidence": [
+                    "ERROR DiskBlockManager: Disk write failed at /local_disk0/spark/storage",
+                    "java.io.FileSystemException: /local_disk0/spark/storage: No space left on device",
+                    "Cannot write to output stream: No space left on device"
+                ],
+                "details": "The local storage directory for Spark shuffle data is full."
+            }
+        ]
+        
+        selected_error = random.choice(disk_error_patterns)
+        
+        return {
+            "issue_type": failure_type.value,
+            "confidence": 0.78,
+            "evidence": selected_error["evidence"],
+            "details": selected_error["details"],
+            "recommendations": [
+                "Clean up unused data files",
+                "Use more efficient storage formats (Parquet, Delta)",
+                "Implement data lifecycle policies",
+                "Adjust shuffle partition count to create smaller files"
+            ],
+            "cluster_context": {
+                "available_disk_space": "2.1GB",
+                "used_disk_space": "98.5%",
+                "filesystem_type": "ext4"
+            },
+        }
+    elif failure_type == FailureType.DEPENDENCY_ERROR:
+        # Various dependency error patterns
+        dependency_error_patterns = [
+            {
+                "error": "Class Not Found Exception",
+                "evidence": [
+                    "java.lang.ClassNotFoundException: org.apache.spark.sql.delta.DeltaTable",
+                    "at java.net.URLClassLoader.findClass(URLClassLoader.java:382)",
+                    "at java.lang.ClassLoader.loadClass(ClassLoader.java:418)"
+                ],
+                "details": "The required Java class for Delta Lake operations was not found in the classpath."
+            },
+            {
+                "error": "Module Not Found Error",
+                "evidence": [
+                    "ModuleNotFoundError: No module named 'pyarrow.fs'",
+                    "at line 14 in command",
+                    "from pyarrow import fs"
+                ],
+                "details": "The Python module 'pyarrow.fs' is missing from the cluster environment."
+            },
+            {
+                "error": "Library Installation Failure",
+                "evidence": [
+                    "pip install --upgrade /local_disk0/tmp/addedFilec/mypackage --disable-pip-version-check",
+                    "ERROR: COMMAND FAILED WITH STATUS 1",
+                    "Error: An error occurred while installing package 'mypackage'"
+                ],
+                "details": "Failed to install a required library package on the cluster."
+            },
+            {
+                "error": "Version Conflict Error",
+                "evidence": [
+                    "ERROR Executor: Exception in task 0.0 in stage 2.0 (TID 2)",
+                    "java.lang.NoSuchMethodError: org.apache.hadoop.fs.azurebfs.AzureBlobFileSystem.initialize(Ljava/net/URI;Lorg/apache/hadoop/conf/Configuration;)V",
+                    "at org.apache.hadoop.fs.FileSystem.createFileSystem(FileSystem.java:3303)"
+                ],
+                "details": "Incompatible versions of libraries are causing method conflicts."
+            }
+        ]
+        
+        selected_error = random.choice(dependency_error_patterns)
+        
+        return {
+            "issue_type": failure_type.value,
+            "confidence": 0.82,
+            "evidence": selected_error["evidence"],
+            "details": selected_error["details"],
+            "recommendations": [
+                "Install missing dependencies",
+                "Check library compatibility",
+                "Add initialization scripts to install required packages",
+                "Properly configure cluster with required libraries"
+            ],
+            "cluster_context": {
+                "spark_version": "10.4.x-scala2.12",
+                "python_version": "3.8.10",
+                "installed_libraries": [
+                    {"name": "pandas", "version": "1.3.4"},
+                    {"name": "numpy", "version": "1.21.3"}
+                ]
+            },
+        }
+    else:
+        # Generic unknown issue
+        return {
+            "issue_type": failure_type.value,
+            "confidence": 0.4,
+            "evidence": [
+                "Task failed without specific error messages",
+                "Process exited with non-zero status",
+                "Cluster event logs show unexpected termination"
+            ],
+            "details": "The job failed for unknown reasons. No specific error pattern was detected.",
+            "recommendations": [
+                "Check Databricks job configuration",
+                "Review data quality and pipeline inputs",
+                "Examine cluster usage metrics",
+                "Enable debug logging for more detailed diagnostics"
+            ],
+            "cluster_context": {},
+        } 

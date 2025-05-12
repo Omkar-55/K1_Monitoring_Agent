@@ -11,6 +11,8 @@ import json
 import uuid
 from datetime import datetime
 from dotenv import load_dotenv
+import re
+import time
 
 # Load environment variables from .env file
 load_dotenv()
@@ -121,7 +123,7 @@ async def process_monitoring_job(job_id, run_id=None, approved_fix=None, simulat
         )
         
         # Create or get the agent
-    agent = get_agent()
+        agent = get_agent()
         
         # Process the request
         response = await agent.process_request(request)
@@ -130,116 +132,6 @@ async def process_monitoring_job(job_id, run_id=None, approved_fix=None, simulat
     except Exception as e:
         logger.error(f"Error processing monitoring job: {e}", exc_info=True)
         return {"error": str(e)}
-
-# Function to handle user messages
-def handle_user_message(user_message):
-    """Handle user message and update conversation history"""
-    # Add user message to the conversation
-    st.session_state.messages.append({"role": "user", "content": user_message})
-    
-    # Check if the message contains job information
-    if "job" in user_message.lower() and any(word in user_message.lower() for word in ["diagnose", "check", "fix", "monitor"]):
-        # Try to extract job ID
-        import re
-        job_id_match = re.search(r"job[_\s-]?id[:\s]+([a-zA-Z0-9_-]+)", user_message, re.IGNORECASE)
-        run_id_match = re.search(r"run[_\s-]?id[:\s]+([a-zA-Z0-9_-]+)", user_message, re.IGNORECASE)
-        
-        job_id = job_id_match.group(1) if job_id_match else None
-        run_id = run_id_match.group(1) if run_id_match else None
-        
-        if job_id:
-            # Set simulate to True for development testing
-            simulate = True
-            simulate_failure = "memory_exceeded"
-            
-            # Add thinking message
-            st.session_state.agent_thinking = True
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": "I'm analyzing this Databricks job...",
-                "thinking": True
-            })
-            
-            # Run the monitoring job asynchronously
-            st.session_state.current_job_id = job_id
-            st.session_state.current_run_id = run_id
-            
-            # Start monitoring task
-            st.experimental_rerun()
-        else:
-            # Add assistant message asking for job ID
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": "I need the Job ID to diagnose issues. Can you provide it? For example: 'Check job_id ABC123'"
-            })
-    else:
-        # Add basic assistant response
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": "I'm here to help diagnose Databricks pipeline issues. Please provide a Job ID for me to analyze."
-        })
-
-# Function to approve a fix
-def approve_fix(fix_id):
-    """Approve a suggested fix and apply it"""
-    if st.session_state.current_monitoring_response:
-        # Set flag to apply the fix in the next run
-        st.session_state.approved_fix = fix_id
-        st.session_state.agent_thinking = True
-        
-        # Add a message indicating approval
-        st.session_state.messages.append({
-            "role": "user", 
-            "content": f"I approve the suggested fix."
-        })
-        
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": "Applying the approved fix...",
-            "thinking": True
-        })
-        
-        # Trigger a rerun to apply the fix
-        st.experimental_rerun()
-
-# Function to display the fix suggestion with approval button
-def display_fix_suggestion(response):
-    """Display the fix suggestion with an approval button"""
-    if not response.pending_approval or not response.suggested_fix:
-        return
-    
-    with st.chat_message("assistant"):
-        # Create a container for the fix suggestion
-        fix = response.suggested_fix
-        
-        st.markdown("### Suggested Fix")
-        st.markdown(fix.get("description", "No description available"))
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Confidence", f"{fix.get('confidence', 0.0):.0%}")
-        with col2:
-            st.metric("Estimated Time", fix.get("estimated_time", "Unknown"))
-        with col3:
-            st.metric("Fix Attempt", fix.get("attempt", 1))
-        
-        if "expected_impact" in fix:
-            st.markdown(f"**Expected Impact**: {fix['expected_impact']}")
-        
-        if "required_permissions" in fix:
-            st.markdown(f"**Required Permissions**: {', '.join(fix['required_permissions'])}")
-        
-        # Display technical details in an expander
-        with st.expander("Technical Details"):
-            st.json({
-                "fix_type": fix.get("fix_type"),
-                "parameters": fix.get("parameters", {})
-            })
-        
-        # Show approve button
-        fix_id = fix.get("fix_id")
-        st.button("Apply Fix", key=f"approve_{fix_id}", on_click=approve_fix, args=(fix_id,))
-        st.button("Reject and Ask for Alternative", key=f"reject_{fix_id}")
 
 # Function to display the agent's reasoning
 def display_reasoning(response):
@@ -286,10 +178,36 @@ def display_reasoning(response):
 # Function to display agent's recommendations
 def display_report(response):
     """Display the agent's final report"""
+    logger.info(f"Attempting to display report. Has report: {response.report is not None}")
+    logger.info(f"Fix successful: {response.fix_successful}")
+    
     if response.report:
-        with st.chat_message("assistant"):
-            st.markdown("## Final Analysis Report")
+        try:
+            logger.info(f"Report length: {len(response.report)} characters")
+            logger.info("Displaying final report in UI")
+            with st.chat_message("assistant"):
+                st.markdown("## Final Analysis Report")
+                st.markdown(response.report)
+                
+                # Add a button to access the report again if needed
+                if st.button("Show Full Report Again"):
+                    st.session_state.show_full_report = True
+        except Exception as e:
+            logger.error(f"Error displaying report: {e}", exc_info=True)
+            st.error(f"Error displaying report: {str(e)}")
+            # Fallback display
+            st.text(response.report[:1000] + "..." if len(response.report) > 1000 else response.report)
+    else:
+        logger.warning("No report to display")
+        
+# Force display of report if requested
+if "show_full_report" in st.session_state and st.session_state.show_full_report and st.session_state.current_monitoring_response:
+    response = st.session_state.current_monitoring_response
+    if response.report:
+        with st.container():
+            st.markdown("## Final Analysis Report (Regenerated)")
             st.markdown(response.report)
+        st.session_state.show_full_report = False
 
 # Main UI function
 def main():
@@ -297,49 +215,381 @@ def main():
     st.title("📊 Pipeline Doctor")
     st.markdown("Your intelligent assistant for diagnosing and fixing Databricks pipeline issues.")
     
-    # Sidebar for configuration
+    # Debug section (temporary)
+    with st.expander("Debug Info", expanded=False):
+        if st.session_state.current_monitoring_response:
+            response = st.session_state.current_monitoring_response
+            st.write("Current Monitoring Response:")
+            st.write(f"- fix_successful: {response.fix_successful}")
+            st.write(f"- pending_approval: {response.pending_approval}")
+            st.write(f"- has report: {response.report is not None}")
+            st.write(f"- issue_type: {response.issue_type}")
+            st.write(f"- fix_attempts: {response.fix_attempts}")
+            st.write(f"- reasoning steps: {len(response.reasoning)}")
+            st.write(f"- most recent step: {response.reasoning[-1]['step'] if response.reasoning else 'none'}")
+    
+    # Initialize sidebar
+    initialize_sidebar()
+    
+    # Initialize chat state
+    initialize_chat()
+    
+    # Display the chat interface
+    display_chat_history()
+    
+    # Process messages (wait for user input or handle previous requests)
+    process_messages()
+
+# Function to display agent's chat responses
+def display_chat_history():
+    """Display the chat history"""
+    # Display all messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+# Function to process new messages
+def process_messages():
+    """Process new messages and agent responses"""
+    # Check if we need to process a monitoring request from sidebar
+    if st.session_state.get("process_monitor", False):
+        job_id = st.session_state.get("job_id_input", "")
+        if job_id:
+            logger.info(f"Processing monitoring request from sidebar for job ID: {job_id}")
+            asyncio.run(handle_message(f"monitor {job_id}"))
+            st.session_state.process_monitor = False
+            return
+    
+    # Handle user input if not waiting for approval
+    if not st.session_state.get("waiting_for_approval", False):
+        message = st.chat_input("How can I help diagnose your Databricks job issues?")
+        
+        if message:
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": message})
+            
+            # Process user message
+            asyncio.run(handle_message(message))
+    
+    # Display the approve/reject buttons if waiting for approval
+    if st.session_state.get("waiting_for_approval", False) and st.session_state.get("current_fix", None):
+        show_approval_buttons()
+
+def show_approval_buttons():
+    """Show approval buttons for the current fix suggestion"""
+    if not st.session_state.get("current_fix"):
+        return
+        
+    fix = st.session_state.current_fix
+    
+    fix_id = fix.get("fix_id", "unknown")
+    fix_description = fix.get("description", "No description available")
+    fix_params = fix.get("parameters", {})
+    
+    with st.chat_message("assistant"):
+        # Create a well-structured fix suggestion display
+        st.markdown("### 🔧 Suggested Fix")
+        st.markdown(fix_description)
+        
+        # Display additional info in a clean format
+        st.info(f"This fix will address the {st.session_state.current_monitoring_response.issue_type.replace('_', ' ')} issue detected earlier.")
+        
+        # Display parameters in an expandable container
+        with st.expander("Technical Details"):
+            st.json(fix_params)
+        
+        # Add a clear separator
+        st.markdown("---")
+        st.markdown("**Would you like to apply this fix?**")
+        
+        # Create a container for the approve/reject buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ Apply Fix", key="approve", type="primary"):
+                logger.info(f"User approved fix {fix_id}")
+                st.session_state.messages.append({
+                    "role": "user", 
+                    "content": "I approve this fix."
+                })
+                st.session_state.waiting_for_approval = False
+                st.session_state.approved_fix = fix
+                st.session_state.current_fix = None
+                
+                # Rerun to apply the fix
+                st.rerun()
+        
+        with col2:
+            if st.button("❌ Reject Fix", key="reject"):
+                logger.info(f"User rejected fix {fix_id}")
+                st.session_state.messages.append({
+                    "role": "user", 
+                    "content": "I reject this fix. Please suggest another approach."
+                })
+                st.session_state.waiting_for_approval = False
+                st.session_state.current_fix = None
+                
+                # Rerun to get another suggestion
+                st.rerun()
+
+# Handle user messages
+async def handle_message(message):
+    """Handle user message and process with the monitoring agent"""
+    try:
+        # Check if message is a monitoring request
+        monitor_match = re.search(r'(?i)monitor\s+(\S+)', message)
+        job_id = None
+        
+        if monitor_match:
+            job_id = monitor_match.group(1)
+            logger.info(f"Extracted job ID from message: {job_id}")
+        else:
+            # Try other patterns
+            job_id_match = re.search(r'job[_-]?(\d+)', message, re.IGNORECASE)
+            if job_id_match:
+                job_id = f"job_{job_id_match.group(1)}"
+            
+            # Look for phrases like "check job 12345"
+            check_job_match = re.search(r'(?:check|diagnose|analyze)\s+(?:job|run)?\s*(\d+)', message, re.IGNORECASE)
+            if check_job_match:
+                job_id = f"job_{check_job_match.group(1)}"
+        
+        # Check for approval message
+        is_approval = re.search(r'(?i)approve|yes|accept|apply', message) and not re.search(r'(?i)don\'t|not|no', message)
+        is_rejection = re.search(r'(?i)reject|no|decline|don\'t', message) 
+        
+        # Handle approval or rejection via chat
+        if is_approval and st.session_state.get("current_monitoring_response") and st.session_state.get("current_monitoring_response").suggested_fix:
+            response = st.session_state.current_monitoring_response
+            fix = response.suggested_fix
+            
+            logger.info(f"User approved fix via chat: {fix.get('fix_id')}")
+            st.session_state.approved_fix = fix
+            st.session_state.waiting_for_approval = False
+            
+            # Process the approved fix
+            with st.chat_message("assistant"):
+                st.markdown("Applying the approved fix...")
+            
+            # Process the fix
+            new_response = await process_monitoring_job(
+                job_id=response.job_id,
+                approved_fix=fix.get("fix_id"),
+                simulate=st.session_state.get("simulate", True),
+                failure_type=st.session_state.get("failure_type")
+            )
+            
+            st.session_state.current_monitoring_response = new_response
+            
+            # Show success message
+            if new_response.fix_successful:
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": f"✅ Fix applied successfully! The issue with job {response.job_id} has been resolved."
+                })
+                
+                # Show report
+                if new_response.report:
+                    st.session_state.show_report = True
+                    
+            else:
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": f"❌ The fix was not fully successful. Let me analyze and suggest another approach."
+                })
+            
+            st.rerun()
+            return
+            
+        elif is_rejection and st.session_state.get("current_monitoring_response") and st.session_state.get("current_monitoring_response").suggested_fix:
+            response = st.session_state.current_monitoring_response
+            fix = response.suggested_fix
+            
+            logger.info(f"User rejected fix via chat: {fix.get('fix_id')}")
+            st.session_state.waiting_for_approval = False
+            st.session_state.current_fix = None
+            
+            # Add rejection message
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": "I'll look for another solution approach. Please let me know if you have specific concerns about the suggested fix."
+            })
+            
+            st.rerun()
+            return
+        
+        if job_id or re.search(r'(?i)simulate|test|try', message):
+            # Get simulation settings from sidebar
+            simulate = st.session_state.get("simulate", False)
+            failure_type = st.session_state.get("failure_type", None) if simulate else None
+            
+            # If job ID found, start monitoring process
+            if job_id:
+                # Display thinking message
+                with st.chat_message("assistant"):
+                    st.markdown(f"Starting monitoring for job ID: `{job_id}`...")
+                    if simulate:
+                        st.markdown(f"*Simulation mode enabled with failure type: {failure_type}*")
+                
+                # Reset for new monitoring session
+                st.session_state.current_monitoring_response = None
+                st.session_state.current_fix = None
+                st.session_state.approved_fix = None
+                st.session_state.waiting_for_approval = False
+                
+                # Process the monitoring request
+                response = await process_monitoring_job(
+                    job_id=job_id,
+                    simulate=simulate,
+                    failure_type=failure_type
+                )
+                
+                # Store the response in session state
+                st.session_state.current_monitoring_response = response
+                
+                # Display agent reasoning steps if available
+                if response.reasoning:
+                    display_reasoning(response)
+                
+                # If issue detected, show diagnosis and fix suggestions
+                if response.issue_detected:
+                    issue_message = f"I've analyzed job `{job_id}` and found a {response.issue_type.replace('_', ' ')} issue."
+                    
+                    # Add evidence and details to the message
+                    evidence_text = ""
+                    if hasattr(response, "evidence") and response.evidence:
+                        evidence_text = "\n\n**Evidence:**\n" + "\n".join([f"- {item}" for item in response.evidence[:3]])
+                    
+                    details_text = ""
+                    for step in response.reasoning:
+                        if step.get("step") == "diagnosis" and step.get("details"):
+                            details_text = f"\n\n**Details:**\n{step.get('details')}"
+                            break
+                    
+                    # Add full message with context
+                    diagnosis_message = f"{issue_message}{evidence_text}{details_text}"
+                    
+                    # Check if there's a suggested fix waiting for approval
+                    if response.pending_approval and response.suggested_fix:
+                        # Store the fix for approval
+                        st.session_state.waiting_for_approval = True
+                        st.session_state.current_fix = response.suggested_fix
+                        
+                        # Add explanation message about the issue first
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": diagnosis_message
+                        })
+                    else:
+                        # Just show the diagnosis
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": diagnosis_message
+                        })
+                else:
+                    # No issues detected
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": f"I've analyzed job `{job_id}` and didn't find any issues. The job appears to be running normally."
+                    })
+                
+                # Force a rerun to display the results
+                st.rerun()
+                
+            else:
+                # No job ID provided, but simulate requested
+                with st.chat_message("assistant"):
+                    st.markdown("To begin monitoring, please provide a Databricks job ID. For example: 'Monitor job_123456' or 'Check job 789012'")
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": "To begin monitoring, please provide a Databricks job ID. For example: 'Monitor job_123456' or 'Check job 789012'"
+                    })
+        
+        else:
+            # If we have a final report to show, display it
+            if st.session_state.get("show_report", False) and st.session_state.current_monitoring_response and st.session_state.current_monitoring_response.report:
+                st.session_state.show_report = False
+                display_report(st.session_state.current_monitoring_response)
+                st.rerun()
+                return
+                
+            # General conversation
+            if st.session_state.current_monitoring_response and st.session_state.current_monitoring_response.issue_type:
+                response = st.session_state.current_monitoring_response
+                with st.chat_message("assistant"):
+                    st.markdown(f"I'm currently analyzing a {response.issue_type.replace('_', ' ')} issue with your Databricks job. What else would you like to know?")
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": f"I'm currently analyzing a {response.issue_type.replace('_', ' ')} issue with your Databricks job. What else would you like to know?"
+                    })
+            else:
+                # Handle general questions or prompts
+                with st.chat_message("assistant"):
+                    if "help" in message.lower() or "what can you do" in message.lower():
+                        help_message = "I can help diagnose and fix issues with your Databricks jobs. Please provide a job ID to start. For example: 'Check job_123456' or 'Monitor job 789012'"
+                        st.markdown(help_message)
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": help_message
+                        })
+                    else:
+                        generic_message = "To begin monitoring a Databricks job, please provide a job ID. For example: 'Monitor job_123456' or 'Check job 789012'. You can also use the 'Monitor Job' button in the sidebar."
+                        st.markdown(generic_message)
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": generic_message
+                        })
+        
+    except Exception as e:
+        logger.error(f"Error handling message: {e}", exc_info=True)
+        with st.chat_message("assistant"):
+            st.error(f"I encountered an error: {str(e)}")
+            st.markdown("Please try again or contact support if the issue persists.")
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": f"I encountered an error: {str(e)}. Please try again or contact support if the issue persists."
+            })
+            
+        # Reset waiting status if error occurs
+        st.session_state.waiting_for_approval = False
+
+# Initialize sidebar configuration
+def initialize_sidebar():
+    """Initialize the sidebar configuration"""
     st.sidebar.title("Configuration")
     
     # Job configuration section
     st.sidebar.header("Job Settings")
-    job_id_input = st.sidebar.text_input("Job ID", key="job_id_input")
-    run_id_input = st.sidebar.text_input("Run ID (optional)", key="run_id_input")
+    job_id_input = st.sidebar.text_input("Job ID", value="test_job_123", key="job_id_input")
     
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        simulate = st.checkbox("Simulate", value=True, key="simulate_checkbox")
-    with col2:
-        failure_type = st.selectbox(
+    # Store simulate setting in session state
+    st.session_state.simulate = st.sidebar.checkbox("Simulate", value=True)
+    
+    # Only show failure type if simulate is enabled
+    if st.session_state.simulate:
+        st.session_state.failure_type = st.sidebar.selectbox(
             "Simulated Failure",
             options=["memory_exceeded", "dependency_error", "disk_space_exceeded"],
-            index=0,
-            key="failure_type_select",
-            disabled=not simulate
+            index=0
         )
     
-    if st.sidebar.button("Monitor Job", disabled=not job_id_input):
-        st.session_state.current_job_id = job_id_input
-        st.session_state.current_run_id = run_id_input if run_id_input else None
-        st.session_state.agent_thinking = True
-        st.session_state.messages = []
-        st.session_state.messages.append({
-            "role": "user", 
-            "content": f"Please diagnose job_id {job_id_input}{' run_id ' + run_id_input if run_id_input else ''}"
-        })
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": "I'm analyzing this Databricks job...",
-            "thinking": True
-        })
-        st.experimental_rerun()
+    # Add a monitoring button
+    if st.sidebar.button("Monitor Job", key="monitor_button"):
+        if job_id_input:
+            # Add the monitoring message to chat
+            st.session_state.messages.append({
+                "role": "user", 
+                "content": f"monitor {job_id_input}"
+            })
+            # Set flag to process the monitoring request
+            st.session_state.process_monitor = True
+            st.rerun()
     
     # Logging configuration
     st.sidebar.header("Advanced Settings")
     log_level = st.sidebar.selectbox(
         "Log Level", 
         options=["debug", "info", "warning", "error", "critical"],
-        index=1,
-        key="log_level_select"
+        index=1
     )
     if st.sidebar.button("Apply Logging Configuration"):
         success = configure_logging(log_level)
@@ -353,125 +603,31 @@ def main():
             st.sidebar.success("Tracing enabled successfully!")
         else:
             st.sidebar.error("Failed to enable tracing. Check logs for details.")
+
+# Initialize chat state
+def initialize_chat():
+    """Initialize the chat state if not already done"""
+    # Initialize the session state for messages
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        # Add welcome message
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "👋 I'm Pipeline Doctor, your AI assistant for diagnosing and fixing Databricks pipeline issues. How can I help you today?"
+        })
     
-    # Display the chat interface
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message.get("thinking", False):
-                with st.status("Analyzing...", state="running", expanded=True) as status:
-                    st.markdown(message["content"])
-                    st.write("This may take a moment...")
-            else:
-                st.markdown(message["content"])
+    # Initialize other session state variables
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = f"conv_{int(time.time())}"
     
-    # Handle async monitoring job if agent is thinking
-    if st.session_state.agent_thinking and hasattr(st.session_state, 'current_job_id'):
-        with st.spinner("Processing..."):
-            try:
-                # Run the monitoring job asynchronously
-                job_id = st.session_state.current_job_id
-                run_id = getattr(st.session_state, 'current_run_id', None)
-                approved_fix = getattr(st.session_state, 'approved_fix', None)
-                
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-                
-                response = loop.run_until_complete(process_monitoring_job(
-                    job_id=job_id,
-                    run_id=run_id,
-                    approved_fix=approved_fix,
-                    simulate=st.session_state.simulate_checkbox,
-                    failure_type=st.session_state.failure_type_select
-                ))
-                
-            loop.close()
-            
-                # Update session state
-                st.session_state.current_monitoring_response = response
-                st.session_state.agent_thinking = False
-                
-                # Remove the thinking message
-                if st.session_state.messages and st.session_state.messages[-1].get("thinking", False):
-                    st.session_state.messages.pop()
-                
-                # Add diagnostic results
-                if getattr(st.session_state, 'approved_fix', None):
-                    # This was a fix application
-                    if response.fix_successful:
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": f"✅ Fix applied successfully! The issue with job {job_id} has been resolved."
-                        })
-                    elif response.pending_approval:
-                        # Another fix suggestion
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": "The previous fix didn't completely resolve the issue. I have another suggestion."
-                        })
-                    else:
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": "The fix was applied but didn't fully resolve the issue. Let me analyze what went wrong."
-                        })
-                    
-                    # Clear the approved fix
-                    st.session_state.approved_fix = None
-                else:
-                    # Initial diagnosis
-                    if response.issue_detected:
-                        issue_message = (
-                            f"I've detected an issue with job {job_id}: **{response.issue_type}**\n\n"
-                            "I've analyzed the logs and have a suggested fix."
-                        )
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": issue_message
-                        })
-                    else:
-                        st.session_state.messages.append({
-                            "role": "assistant", 
-                            "content": f"I've analyzed job {job_id} and everything looks good! No issues detected."
-                        })
-                
-                # Force a rerun to display the results
-                st.experimental_rerun()
-            
-        except Exception as e:
-                logger.error(f"Error in monitoring job: {e}", exc_info=True)
-            st.error(f"Error: {str(e)}")
-                
-                # Update session state
-                st.session_state.agent_thinking = False
-                if st.session_state.messages and st.session_state.messages[-1].get("thinking", False):
-                    st.session_state.messages.pop()
-                
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": f"I encountered an error while analyzing the job: {str(e)}"
-                })
-                
-                st.experimental_rerun()
+    if "waiting_for_approval" not in st.session_state:
+        st.session_state.waiting_for_approval = False
     
-    # Display the fix suggestion if available
-    if not st.session_state.agent_thinking and st.session_state.current_monitoring_response:
-        response = st.session_state.current_monitoring_response
-        
-        # Show fix suggestion if pending approval
-        if response.pending_approval and response.suggested_fix:
-            display_fix_suggestion(response)
-        
-        # Show reasoning
-        display_reasoning(response)
-        
-        # Show final report if fix was successful
-        if response.fix_successful and response.report:
-            display_report(response)
+    if "current_monitoring_response" not in st.session_state:
+        st.session_state.current_monitoring_response = None
     
-    # Chat input
-    user_message = st.chat_input("Ask me about your Databricks pipelines...")
-    if user_message:
-        handle_user_message(user_message)
-        st.experimental_rerun()
+    if "process_monitor" not in st.session_state:
+        st.session_state.process_monitor = False
 
 if __name__ == "__main__":
     # Initial logging setup
