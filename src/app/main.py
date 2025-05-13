@@ -288,17 +288,8 @@ def display_report(response):
                     if response.safety_issue_details:
                         st.markdown(f"**Details:**\n{response.safety_issue_details}")
             
-            # Display confidence information
-            if hasattr(response, 'confidence'):
-                confidence_percentage = response.confidence * 100
-                confidence_color = "normal"
-                if confidence_percentage >= 80:
-                    st.success(f"High confidence in this analysis: {confidence_percentage:.1f}%")
-                elif confidence_percentage >= 50:
-                    st.warning(f"Moderate confidence in this analysis: {confidence_percentage:.1f}%")
-                else:
-                    st.error(f"Low confidence in this analysis: {confidence_percentage:.1f}%")
-            
+            # Let the report display the confidence information
+            # The confidence is now included directly in the report
             st.markdown(response.report)
     else:
         st.warning("No final report available")

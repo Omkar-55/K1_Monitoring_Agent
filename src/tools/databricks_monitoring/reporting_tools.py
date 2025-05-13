@@ -12,7 +12,7 @@ from src.agent_core.logging_config import get_logger
 # Get logger for this module
 logger = get_logger(__name__)
 
-def final_report(issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False, job_id: str = "unknown") -> str:
+def final_report(issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False, job_id: str = "unknown", confidence: float = 0.0) -> str:
     """
     Generate a final report for the user after monitoring and fix application.
     
@@ -21,11 +21,12 @@ def final_report(issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[st
         reasoning: List of reasoning steps taken
         fix_successful: Whether the fix was successful
         job_id: The ID of the job that was analyzed
+        confidence: Confidence level of the diagnosis (0.0 to 1.0)
     
     Returns:
         A markdown-formatted report string
     """
-    logger.info("Generating final report")
+    logger.info(f"Generating final report with confidence: {confidence}")
     
     # Get timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,6 +69,21 @@ def final_report(issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[st
         report += f"## ✅ Fix Successful\n\n"
     else:
         report += f"## ❌ Unable to resolve issue. Please contact a data engineer.\n\n"
+    
+    # Confidence section
+    confidence_percentage = confidence * 100
+    confidence_text = ""
+    
+    if confidence_percentage >= 80:
+        confidence_text = f"**High confidence** ({confidence_percentage:.1f}%)"
+    elif confidence_percentage >= 50:
+        confidence_text = f"**Moderate confidence** ({confidence_percentage:.1f}%)"
+    elif confidence_percentage > 0:
+        confidence_text = f"**Low confidence** ({confidence_percentage:.1f}%)"
+    else:
+        confidence_text = "**Confidence level unavailable**"
+    
+    report += f"Diagnosis confidence: {confidence_text}\n\n"
     
     # Situation section
     report += f"## Situation\n\n"

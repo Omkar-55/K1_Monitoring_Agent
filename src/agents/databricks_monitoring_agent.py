@@ -686,6 +686,10 @@ class DatabricksMonitoringAgent:
                     fix_id = str(uuid.uuid4())
                     fix_suggestion["fix_id"] = fix_id
                     
+                    # Store the original confidence value with the fix
+                    fix_suggestion["original_confidence"] = confidence
+                    logger.info(f"AGENT STATE: Storing original confidence {confidence} with fix {fix_id}")
+                    
                     # Store the fix details for later retrieval
                     self.memory.store_fix_details(fix_id, fix_suggestion)
                     
@@ -787,6 +791,14 @@ class DatabricksMonitoringAgent:
             # Log the diagnosis for debugging
             logger.info(f"Diagnosis results for run {run_id}: {json.dumps(diagnosis, default=str)}")
             
+            # Debug logs for reasoning steps
+            if "reasoning" in diagnosis:
+                logger.info(f"DEBUG: Diagnosis has reasoning steps: {len(diagnosis['reasoning'])}")
+                for i, step in enumerate(diagnosis["reasoning"]):
+                    logger.info(f"DEBUG: Reasoning step {i+1}: {step.get('step')} - {step.get('details')[:50]}...")
+            else:
+                logger.warning("DEBUG: Diagnosis DOES NOT have reasoning steps")
+            
             # Ensure we have reasoning steps
             if "reasoning" not in diagnosis or not diagnosis["reasoning"]:
                 diagnosis["reasoning"] = [
@@ -869,13 +881,18 @@ class DatabricksMonitoringAgent:
             if isinstance(fix_result, dict):
                 fix_success = fix_result.get("status") == "success"
             
+            # Get the confidence value from the original diagnosis or fix details
+            confidence = fix_details.get("original_confidence", 0.0)
+            logger.info(f"AGENT STATE: Using confidence value: {confidence} for final report")
+            
             # Generate a report using positional arguments
-            # Argument order: issue_type, reasoning, fix_successful, job_id
+            # Argument order: issue_type, reasoning, fix_successful, job_id, confidence
             report = await self.tools.final_report(
                 fix_details.get("fix_type", "unknown"), 
                 [], 
                 fix_success,
-                job_id
+                job_id,
+                confidence
             )
             logger.info(f"AGENT STATE: Generated report of length {len(report)}")
             
@@ -1003,11 +1020,11 @@ class DatabricksTools:
         
         return apply_fix(job_id, "unknown", fix_type, parameters, simulate=True)
     
-    async def final_report(self, issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False, job_id: str = "unknown") -> str:
+    async def final_report(self, issue_type: Union[str, Dict[str, Any]], reasoning: List[Dict[str, Any]] = None, fix_successful: bool = False, job_id: str = "unknown", confidence: float = 0.0) -> str:
         """Generate a final report."""
         from src.tools.databricks_monitoring import final_report
         
-        return final_report(issue_type, reasoning, fix_successful, job_id)
+        return final_report(issue_type, reasoning, fix_successful, job_id, confidence)
 
 # Helper class for fix memory
 class FixMemoryStore:
