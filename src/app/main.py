@@ -5,6 +5,7 @@ An intelligent assistant for diagnosing and fixing Databricks pipeline issues.
 """
 
 import os
+import sys
 import streamlit as st
 import asyncio
 import json
@@ -13,6 +14,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 import re
 import time
+
+# Add the project root directory to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 # Load environment variables from .env file
 load_dotenv()

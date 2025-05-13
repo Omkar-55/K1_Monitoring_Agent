@@ -589,13 +589,13 @@ class DatabricksMonitoringAgent:
                     logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')} (confidence: {fix_suggestion.get('confidence', 0.0)}) - awaiting user approval")
                 else:
                     logger.warning("AGENT STATE: No fix could be suggested for the diagnosed issue")
-                else:
+            else:
                 logger.info(f"AGENT STATE: User approved fix, but details weren't found. In normal operation, regenerating fix")
         else:
             logger.info("AGENT STATE: No issues detected in the logs")
         
         logger.info(f"AGENT STATE: Returning response: {response}")
-            return response
+        return response
             
     async def _get_logs(self, job_id: str, simulate: bool = False, simulate_failure_type: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
         """
@@ -628,7 +628,7 @@ class DatabricksMonitoringAgent:
             try:
                 run_id = await self.dbx_client.get_most_recent_run_id(job_id)
                 logger.info(f"AGENT STATE: Found most recent run ID: {run_id}")
-        except Exception as e:
+            except Exception as e:
                 logger.error(f"Error getting most recent run ID: {e}")
                 # Generate a placeholder run ID
                 timestamp = int(time.time())
@@ -638,7 +638,7 @@ class DatabricksMonitoringAgent:
             try:
                 logs_data = await self.tools.get_logs(job_id, run_id)
                 logger.info(f"AGENT STATE: Retrieved {len(logs_data.get('logs', []))} log entries for run {run_id}")
-                except Exception as e:
+            except Exception as e:
                 logger.error(f"Error getting logs: {e}")
                 logs_data = {
                     "run_id": run_id,

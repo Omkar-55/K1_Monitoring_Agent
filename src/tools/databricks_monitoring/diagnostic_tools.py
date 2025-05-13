@@ -76,17 +76,17 @@ def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dic
     # Always use AI-based diagnosis
     try:
         logger.info("Performing AI-based diagnosis")
-            ai_diagnosis = diagnose_with_ai(logs_data)
-            
-            # Check confidence threshold
+        ai_diagnosis = diagnose_with_ai(logs_data)
+        
+        # Check confidence threshold
         if ai_diagnosis.get("confidence", 0) >= 0.3:
             logger.info(f"AI diagnosis complete with confidence {ai_diagnosis.get('confidence')}")
-                return ai_diagnosis
-            else:
+            return ai_diagnosis
+        else:
             logger.warning(f"AI diagnosis confidence too low ({ai_diagnosis.get('confidence')})")
             # Even with low confidence, still return the AI diagnosis
             return ai_diagnosis
-        except Exception as e:
+    except Exception as e:
         logger.error(f"AI diagnosis failed: {e}")
         # Return a basic unknown error diagnosis
         return {
