@@ -78,6 +78,28 @@ def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dic
         logger.info("Performing AI-based diagnosis")
         ai_diagnosis = diagnose_with_ai(logs_data)
         
+        # Add reasoning steps to the diagnosis
+        reasoning_steps = [
+            {
+                "step": "log_analysis",
+                "details": "Analyzed Databricks job logs for error patterns and performance issues",
+                "result": "Found relevant log entries for diagnosis"
+            },
+            {
+                "step": "issue_identification",
+                "details": f"Identified issue type: {ai_diagnosis.get('issue_type', 'unknown')}",
+                "result": f"Confidence: {ai_diagnosis.get('confidence', 0.0)}"
+            },
+            {
+                "step": "evidence_collection",
+                "details": "Collected supporting evidence from logs",
+                "result": "\n".join(ai_diagnosis.get('evidence', []))
+            }
+        ]
+        
+        # Add reasoning steps to the diagnosis
+        ai_diagnosis["reasoning"] = reasoning_steps
+        
         # Check confidence threshold
         if ai_diagnosis.get("confidence", 0) >= 0.3:
             logger.info(f"AI diagnosis complete with confidence {ai_diagnosis.get('confidence')}")
@@ -94,7 +116,14 @@ def diagnose(logs_data: Dict[str, Any], cluster_id: Optional[str] = None) -> Dic
             "confidence": 0.1,
             "evidence": [],
             "details": f"Failed to diagnose the issue: {str(e)}",
-            "recommendations": ["Check logs manually", "Contact support"]
+            "recommendations": ["Check logs manually", "Contact support"],
+            "reasoning": [
+                {
+                    "step": "error",
+                    "details": f"Error during diagnosis: {str(e)}",
+                    "result": "Failed to complete diagnosis"
+                }
+            ]
         }
 
 def _extract_issue_type_from_text(text: str) -> FailureType:
@@ -282,6 +311,20 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
     run_id = f"run_{int(time.time())}"
     logger.info(f"Simulated run {run_id} with failure type: {failure_type.value}")
     
+    # Common reasoning steps for all diagnoses
+    common_reasoning_steps = [
+        {
+            "step": "log_collection",
+            "details": "Retrieved and parsed Databricks job logs from the specified job run",
+            "result": "Successfully collected log data for analysis"
+        },
+        {
+            "step": "pattern_analysis",
+            "details": "Analyzed logs for common error patterns and signatures",
+            "result": "Identified key error patterns in the logs"
+        }
+    ]
+    
     # Detailed error logs for each failure type
     if failure_type == FailureType.MEMORY_EXCEEDED:
         # Choose one of several memory error patterns
@@ -327,6 +370,25 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
         # Select one pattern randomly
         selected_error = random.choice(memory_error_patterns)
         
+        # Add memory-specific reasoning steps
+        memory_reasoning = common_reasoning_steps + [
+            {
+                "step": "memory_analysis",
+                "details": "Examined memory usage patterns and allocation in executor logs",
+                "result": "Detected memory pressure during job execution"
+            },
+            {
+                "step": "error_classification",
+                "details": f"Analyzed error type: {selected_error['error']}",
+                "result": "Classified as memory exceeded issue with high confidence"
+            },
+            {
+                "step": "root_cause_identification",
+                "details": "Traced error to specific operation in job execution",
+                "result": selected_error["details"]
+            }
+        ]
+        
         return {
             "issue_type": failure_type.value,
             "confidence": 0.85,
@@ -344,7 +406,8 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                 "spark.memory.fraction": "0.6",
                 "spark.memory.storageFraction": "0.5"
             },
-            "issue_detected": True
+            "issue_detected": True,
+            "reasoning": memory_reasoning
         }
     elif failure_type == FailureType.DISK_SPACE_EXCEEDED:
         # Different disk space error patterns
@@ -381,6 +444,25 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
         
         selected_error = random.choice(disk_error_patterns)
         
+        # Add disk-specific reasoning steps
+        disk_reasoning = common_reasoning_steps + [
+            {
+                "step": "disk_space_analysis",
+                "details": "Examined disk usage and storage allocation patterns",
+                "result": "Detected filesystem capacity issues during job execution"
+            },
+            {
+                "step": "error_classification",
+                "details": f"Analyzed error type: {selected_error['error']}",
+                "result": "Classified as disk space exceeded issue with high confidence"
+            },
+            {
+                "step": "file_operation_tracing",
+                "details": "Identified file operations that triggered the failure",
+                "result": "Found critical failure during shuffle write operations"
+            }
+        ]
+        
         return {
             "issue_type": failure_type.value,
             "confidence": 0.78,
@@ -397,7 +479,8 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                 "used_disk_space": "98.5%",
                 "filesystem_type": "ext4"
             },
-            "issue_detected": True
+            "issue_detected": True,
+            "reasoning": disk_reasoning
         }
     elif failure_type == FailureType.DEPENDENCY_ERROR:
         # Various dependency error patterns
@@ -442,6 +525,25 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
         
         selected_error = random.choice(dependency_error_patterns)
         
+        # Add dependency-specific reasoning steps
+        dependency_reasoning = common_reasoning_steps + [
+            {
+                "step": "dependency_analysis",
+                "details": "Examined library and package dependencies in the cluster configuration",
+                "result": "Detected missing or incompatible dependencies"
+            },
+            {
+                "step": "error_classification",
+                "details": f"Analyzed error type: {selected_error['error']}",
+                "result": "Classified as dependency error with high confidence"
+            },
+            {
+                "step": "stack_trace_analysis",
+                "details": "Analyzed stack trace to pinpoint missing or incompatible components",
+                "result": f"Identified specific dependency issue: {selected_error['error']}"
+            }
+        ]
+        
         return {
             "issue_type": failure_type.value,
             "confidence": 0.82,
@@ -461,10 +563,29 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                     {"name": "numpy", "version": "1.21.3"}
                 ]
             },
-            "issue_detected": True
+            "issue_detected": True,
+            "reasoning": dependency_reasoning
         }
     else:
         # Generic unknown issue
+        unknown_reasoning = common_reasoning_steps + [
+            {
+                "step": "error_pattern_search",
+                "details": "Searched for known error patterns in log output",
+                "result": "No clear error pattern detected in the logs"
+            },
+            {
+                "step": "resource_analysis",
+                "details": "Checked cluster resources and configuration",
+                "result": "No obvious resource constraints or misconfigurations found"
+            },
+            {
+                "step": "process_monitoring",
+                "details": "Analyzed process timing and execution flow",
+                "result": "Process terminated abnormally without specific error"
+            }
+        ]
+        
         return {
             "issue_type": failure_type.value,
             "confidence": 0.4,
@@ -481,5 +602,6 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
                 "Enable debug logging for more detailed diagnostics"
             ],
             "cluster_context": {},
-            "issue_detected": True
+            "issue_detected": True,
+            "reasoning": unknown_reasoning
         } 

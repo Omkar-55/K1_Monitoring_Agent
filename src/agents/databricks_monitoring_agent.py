@@ -119,13 +119,15 @@ class MonitoringResponse(BaseModel):
     fix_successful: Optional[bool] = Field(None, description="Whether the fix was successful")
     reasoning: List[Dict[str, Any]] = Field(default_factory=list, description="The reasoning steps taken")
     report: Optional[str] = Field(None, description="Final report text")
-    hallucination_detected: bool = Field(False, description="Whether hallucination was detected")
-    safety_issues: bool = Field(False, description="Whether safety issues were detected")
-    confidence: float = Field(0.0, description="Confidence in the solution")
+    hallucination_detected: bool = Field(False, description="Whether hallucination was detected in any response")
+    safety_issues: bool = Field(False, description="Whether safety issues were detected in any response")
+    confidence: float = Field(0.0, description="Overall confidence in the solution (0.0 to 1.0)")
     pending_approval: bool = Field(False, description="Whether user approval is pending")
     suggested_fix: Optional[Dict[str, Any]] = Field(None, description="The fix suggestion awaiting approval")
     conversation_id: Optional[str] = Field(None, description="Unique ID for the conversation")
     fix_history: List[Dict[str, Any]] = Field(default_factory=list, description="History of suggested fixes")
+    hallucination_details: Optional[str] = Field(None, description="Details about detected hallucinations")
+    safety_issue_details: Optional[str] = Field(None, description="Details about detected safety issues")
 
 class DatabricksMonitoringAgent:
     """
@@ -526,6 +528,9 @@ class DatabricksMonitoringAgent:
             suggested_fix=None,
             fix_successful=None,
             report=None,
+            hallucination_detected=False,
+            safety_issues=False,
+            conversation_id=request.conversation_id
         )
         
         # Check if the user has approved a fix
@@ -539,6 +544,23 @@ class DatabricksMonitoringAgent:
                 fix_result = await self._apply_fix(fix_details, job_id)
                 response.fix_successful = fix_result.get("successful", False)
                 response.report = fix_result.get("report", "")
+                
+                # Validate the fix result output
+                if AGENTS_SDK_AVAILABLE and self.assistant:
+                    try:
+                        output_validation = await self.validate_output(
+                            RunContextWrapper(), 
+                            self.assistant, 
+                            fix_result.get("report", "")
+                        )
+                        if output_validation.tripwire_triggered:
+                            response.hallucination_detected = True
+                            response.confidence *= 0.5  # Reduce confidence if hallucination detected
+                            response.hallucination_details = output_validation.output_info.reason
+                            logger.warning(f"Hallucination detected in fix result: {output_validation.output_info.reason}")
+                    except Exception as e:
+                        logger.error(f"Error validating fix output: {e}")
+                
                 logger.info(f"AGENT STATE: Applied fix with result: {fix_result}")
                 return response
             else:
@@ -557,6 +579,42 @@ class DatabricksMonitoringAgent:
         diagnosis = await self._diagnose_issue(logs_data, run_id)
         logger.info(f"AGENT STATE: Diagnosis complete: {diagnosis}")
         
+        # Validate the diagnosis output
+        if AGENTS_SDK_AVAILABLE and self.assistant:
+            try:
+                output_validation = await self.validate_output(
+                    RunContextWrapper(), 
+                    self.assistant, 
+                    json.dumps(diagnosis)
+                )
+                if output_validation.tripwire_triggered:
+                    response.hallucination_detected = True
+                    response.confidence *= 0.5  # Reduce confidence if hallucination detected
+                    response.hallucination_details = output_validation.output_info.reason
+                    logger.warning(f"Hallucination detected in diagnosis: {output_validation.output_info.reason}")
+                
+                # Check for safety issues
+                if self.safety_policy:
+                    content_filter_results = self.safety_policy.evaluate(json.dumps(diagnosis))
+                    if content_filter_results.has_filtered_content:
+                        response.safety_issues = True
+                        response.confidence *= 0.3  # Significantly reduce confidence if safety issues detected
+                        safety_details = []
+                        if content_filter_results.harmful_content_score > 0:
+                            safety_details.append(f"Harmful content detected (score: {content_filter_results.harmful_content_score:.2f})")
+                        if content_filter_results.harassment_content_score > 0:
+                            safety_details.append(f"Harassment content detected (score: {content_filter_results.harassment_content_score:.2f})")
+                        if content_filter_results.hate_content_score > 0:
+                            safety_details.append(f"Hate content detected (score: {content_filter_results.hate_content_score:.2f})")
+                        if content_filter_results.sexual_content_score > 0:
+                            safety_details.append(f"Sexual content detected (score: {content_filter_results.sexual_content_score:.2f})")
+                        if content_filter_results.self_harm_content_score > 0:
+                            safety_details.append(f"Self-harm content detected (score: {content_filter_results.self_harm_content_score:.2f})")
+                        response.safety_issue_details = "\n".join(safety_details)
+                        logger.warning(f"Safety issues detected in diagnosis: {response.safety_issue_details}")
+            except Exception as e:
+                logger.error(f"Error validating diagnosis output: {e}")
+        
         # Check if an issue was detected
         if diagnosis.get("issue_detected", False):
             issue_type = diagnosis.get("issue_type", "unknown")
@@ -567,12 +625,61 @@ class DatabricksMonitoringAgent:
             response.issue_detected = True
             response.issue_type = issue_type
             response.confidence = confidence
-            response.reasoning = diagnosis.get("reasoning", [])
+            
+            # Ensure reasoning is properly passed to the response
+            if "reasoning" in diagnosis and diagnosis["reasoning"]:
+                response.reasoning = diagnosis["reasoning"]
+                logger.info(f"Added {len(diagnosis['reasoning'])} reasoning steps to response")
+            else:
+                # Create default reasoning if none exists
+                response.reasoning = [
+                    {
+                        "step": "diagnosis",
+                        "details": diagnosis.get("details", "Analysis of job logs"),
+                        "result": f"Detected {issue_type} issue with {confidence:.2f} confidence"
+                    }
+                ]
+                logger.info("No reasoning in diagnosis, added default reasoning")
             
             # Generate a fix suggestion if an issue was detected
             if not request.approved_fix:  # Only suggest a fix if we're not already applying one
                 logger.info(f"AGENT STATE: Generating fix suggestion for issue: {issue_type}")
                 fix_suggestion = await self._suggest_fix(issue_type, logs_data)
+                
+                # Validate the fix suggestion
+                if AGENTS_SDK_AVAILABLE and self.assistant and fix_suggestion:
+                    try:
+                        output_validation = await self.validate_output(
+                            RunContextWrapper(), 
+                            self.assistant, 
+                            json.dumps(fix_suggestion)
+                        )
+                        if output_validation.tripwire_triggered:
+                            response.hallucination_detected = True
+                            response.hallucination_details = output_validation.output_info.reason
+                            logger.warning(f"Hallucination detected in fix suggestion: {output_validation.output_info.reason}")
+                        
+                        # Check for safety issues
+                        if self.safety_policy:
+                            content_filter_results = self.safety_policy.evaluate(json.dumps(fix_suggestion))
+                            if content_filter_results.has_filtered_content:
+                                response.safety_issues = True
+                                safety_details = []
+                                if content_filter_results.harmful_content_score > 0:
+                                    safety_details.append(f"Harmful content detected (score: {content_filter_results.harmful_content_score:.2f})")
+                                if content_filter_results.harassment_content_score > 0:
+                                    safety_details.append(f"Harassment content detected (score: {content_filter_results.harassment_content_score:.2f})")
+                                if content_filter_results.hate_content_score > 0:
+                                    safety_details.append(f"Hate content detected (score: {content_filter_results.hate_content_score:.2f})")
+                                if content_filter_results.sexual_content_score > 0:
+                                    safety_details.append(f"Sexual content detected (score: {content_filter_results.sexual_content_score:.2f})")
+                                if content_filter_results.self_harm_content_score > 0:
+                                    safety_details.append(f"Self-harm content detected (score: {content_filter_results.self_harm_content_score:.2f})")
+                                response.safety_issue_details = "\n".join(safety_details)
+                                logger.warning(f"Safety issues detected in fix suggestion: {response.safety_issue_details}")
+                    except Exception as e:
+                        logger.error(f"Error validating fix suggestion: {e}")
+                
                 if fix_suggestion:
                     logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')}")
                     # Generate a unique ID for this fix
@@ -585,12 +692,22 @@ class DatabricksMonitoringAgent:
                     # Add the fix suggestion to the response
                     response.suggested_fix = fix_suggestion
                     
+                    # Add fix suggestion to reasoning steps
+                    response.reasoning.append({
+                        "step": "fix_suggestion",
+                        "details": fix_suggestion.get("description", "Generated fix suggestion based on diagnosis"),
+                        "result": f"Suggested fix type: {fix_suggestion.get('fix_type')}"
+                    })
+                    
                     # Log the suggested fix for tracking
-                    logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')} (confidence: {fix_suggestion.get('confidence', 0.0)}) - awaiting user approval")
+                    logger.info(f"AGENT STATE: Suggested fix: {fix_suggestion.get('fix_type')} - awaiting user approval")
                 else:
                     logger.warning("AGENT STATE: No fix could be suggested for the diagnosed issue")
-            else:
-                logger.info(f"AGENT STATE: User approved fix, but details weren't found. In normal operation, regenerating fix")
+                    response.reasoning.append({
+                        "step": "fix_suggestion",
+                        "details": "Attempted to generate fix suggestion",
+                        "result": "No suitable fix could be determined"
+                    })
         else:
             logger.info("AGENT STATE: No issues detected in the logs")
         
@@ -652,44 +769,61 @@ class DatabricksMonitoringAgent:
     
     async def _diagnose_issue(self, logs_data: Dict[str, Any], run_id: str) -> Dict[str, Any]:
         """
-        Diagnose issues in the logs.
+        Diagnose an issue in the logs.
         
         Args:
-            logs_data: The logs data to diagnose.
-            run_id: The run ID.
+            logs_data: The log data to diagnose
+            run_id: The run ID of the job
             
         Returns:
-            A dictionary with the diagnosis results.
+            A dictionary with the diagnosis results
         """
-        logger.info(f"AGENT STATE: Diagnosing logs for run {run_id}")
-        
         try:
-            # Make sure simulate_failure_type is properly passed through
-            if logs_data.get("simulated", False) and "simulate_failure_type" in logs_data:
-                logger.info(f"AGENT STATE: Using simulated failure type for diagnosis: {logs_data['simulate_failure_type']}")
-                # Preserve the simulate_failure_type in the diagnostic process
-                if "logs" not in logs_data:
-                    logs_data["logs"] = {}
-                
-            diagnosis = await self.tools.diagnose(logs_data, run_id)
+            from src.tools.databricks_monitoring.diagnostic_tools import diagnose
             
-            # If we have an issue_type but no issue_detected flag, set it to True
-            if 'issue_type' in diagnosis and diagnosis['issue_type'] and 'issue_detected' not in diagnosis:
-                diagnosis['issue_detected'] = True
-                
-            logger.info(f"AGENT STATE: Diagnosis complete with result: {diagnosis.get('issue_type', 'no issue')}")
+            # Call the diagnose function to analyze the logs
+            diagnosis = diagnose(logs_data)
+            
+            # Log the diagnosis for debugging
+            logger.info(f"Diagnosis results for run {run_id}: {json.dumps(diagnosis, default=str)}")
+            
+            # Ensure we have reasoning steps
+            if "reasoning" not in diagnosis or not diagnosis["reasoning"]:
+                diagnosis["reasoning"] = [
+                    {
+                        "step": "log_analysis",
+                        "details": "Analyzed Databricks job logs for error patterns",
+                        "result": f"Issue identified: {diagnosis.get('issue_type', 'unknown')}"
+                    },
+                    {
+                        "step": "diagnosis",
+                        "details": diagnosis.get("details", "No detailed diagnosis available"),
+                        "result": f"Confidence level: {diagnosis.get('confidence', 0.0)}"
+                    }
+                ]
+                logger.info("Added default reasoning steps to diagnosis")
+            
+            # Ensure the issue_detected flag is set
+            if "issue_type" in diagnosis and diagnosis["issue_type"] != "unknown":
+                diagnosis["issue_detected"] = True
+            else:
+                diagnosis["issue_detected"] = False
+            
+            return diagnosis
         except Exception as e:
-            logger.error(f"Error during diagnosis: {e}")
-            diagnosis = {
+            logger.error(f"Error diagnosing issue: {e}")
+            return {
                 "issue_detected": False,
                 "issue_type": "unknown",
                 "confidence": 0.0,
                 "reasoning": [
-                    {"step": "error", "description": f"Error during diagnosis: {str(e)}"}
+                    {
+                        "step": "error",
+                        "details": f"Error during diagnosis: {str(e)}",
+                        "result": "Failed to diagnose logs"
+                    }
                 ]
             }
-        
-        return diagnosis
     
     async def _suggest_fix(self, issue_type: str, logs_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """

@@ -173,23 +173,56 @@ async def process_monitoring_job(job_id, run_id=None, approved_fix=None, simulat
 # Function to display the agent's reasoning
 def display_reasoning(response):
     """Display the agent's reasoning in an expander"""
-    with st.expander("View Agent Reasoning", expanded=True):
-        st.markdown("### Analysis Steps")
+    st.markdown("## 🧠 Agent Analysis")
+    
+    # Display hallucination and safety check results
+    with st.container():
+        col1, col2 = st.columns(2)
         
-        for step in response.reasoning:
-            step_name = step.get("step", "unknown").replace("_", " ").title()
-            st.markdown(f"**{step_name}**")
-            
-            # Display result
-            if "result" in step:
-                st.markdown(f"Result: {step['result']}")
-            
-            # Display details if available
-            if "details" in step and step["details"]:
-                st.markdown("Details:")
-                st.markdown(step["details"])
-            
-            st.markdown("---")
+        with col1:
+            hallucination_detected = getattr(response, 'hallucination_detected', False)
+            hallucination_status = "🔍 No Hallucination Detected" if not hallucination_detected else "⚠️ Potential Hallucination Detected"
+            status_color = "success" if not hallucination_detected else "warning"
+            st.markdown(f"**{hallucination_status}**")
+            if hasattr(response, 'hallucination_details') and response.hallucination_details:
+                st.warning(response.hallucination_details)
+            else:
+                st.success("Response validated for factual accuracy")
+        
+        with col2:
+            safety_issues = getattr(response, 'safety_issues', False)
+            safety_status = "✅ No Safety Issues" if not safety_issues else "⚠️ Safety Issues Detected"
+            st.markdown(f"**{safety_status}**")
+            if hasattr(response, 'safety_issue_details') and response.safety_issue_details:
+                st.error(response.safety_issue_details)
+            else:
+                st.success("Response passed safety checks")
+    
+    # Display reasoning steps
+    if hasattr(response, 'reasoning') and response.reasoning:
+        st.markdown("### 🔍 Analysis Steps")
+        
+        # Create a container for reasoning steps (no expander to ensure visibility)
+        with st.container():
+            for step in response.reasoning:
+                step_name = step.get("step", "unknown").replace("_", " ").title()
+                
+                # Create a container for each step
+                with st.container():
+                    st.markdown(f"**{step_name}**")
+                    
+                    # Display details if available
+                    if "details" in step and step["details"]:
+                        st.markdown(step["details"])
+                    
+                    # Display result in a different color/style
+                    if "result" in step:
+                        st.success(f"Result: {step['result']}")
+                    
+                    # Add a separator between steps
+                    st.markdown("---")
+    else:
+        st.warning("No detailed reasoning steps available for this analysis.")
 
 # Function to display agent's recommendations
 def display_report(response):
@@ -197,6 +230,37 @@ def display_report(response):
     if response.report:
         with st.container():
             st.markdown("## Final Analysis Report")
+            
+            # Display any hallucination or safety warnings if present
+            if response.hallucination_detected:
+                with st.warning("⚠️ **Potential Hallucination Warning**"):
+                    st.markdown("""
+                        The response may contain potential hallucinations. 
+                        Please verify critical information before proceeding.
+                    """)
+                    if response.hallucination_details:
+                        st.markdown(f"**Details:** {response.hallucination_details}")
+            
+            if response.safety_issues:
+                with st.error("⚠️ **Safety Issues Detected**"):
+                    st.markdown("""
+                        Safety concerns were identified in the response. 
+                        Please review carefully before taking any action.
+                    """)
+                    if response.safety_issue_details:
+                        st.markdown(f"**Details:**\n{response.safety_issue_details}")
+            
+            # Display confidence information
+            if hasattr(response, 'confidence'):
+                confidence_percentage = response.confidence * 100
+                confidence_color = "normal"
+                if confidence_percentage >= 80:
+                    st.success(f"High confidence in this analysis: {confidence_percentage:.1f}%")
+                elif confidence_percentage >= 50:
+                    st.warning(f"Moderate confidence in this analysis: {confidence_percentage:.1f}%")
+                else:
+                    st.error(f"Low confidence in this analysis: {confidence_percentage:.1f}%")
+            
             st.markdown(response.report)
     else:
         st.warning("No final report available")
@@ -508,9 +572,9 @@ async def handle_message(message):
                 # Store the response in session state
                 st.session_state.current_monitoring_response = response
                 
-                # Display agent reasoning steps if available
-                if response.reasoning:
-                    display_reasoning(response)
+                # Always display agent reasoning steps
+                st.write("") # Add space
+                display_reasoning(response)
                 
                 # If issue detected, show diagnosis and fix suggestions
                 if response.issue_detected:
