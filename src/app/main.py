@@ -172,7 +172,28 @@ async def process_monitoring_job(job_id, run_id=None, approved_fix=None, simulat
 
 # Function to display the agent's reasoning
 def display_reasoning(response):
-    """Display the agent's reasoning in an expander"""
+    """Display the agent's reasoning with animation and save to session state for later viewing"""
+    # Store reasoning in session state for later retrieval
+    if "reasoning_history" not in st.session_state:
+        st.session_state.reasoning_history = {}
+    
+    # Generate a timestamp key
+    import time
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Store this reasoning for later viewing
+    if hasattr(response, 'reasoning') and response.reasoning:
+        reasoning_data = {
+            "timestamp": timestamp,
+            "job_id": getattr(response, 'job_id', 'unknown'),
+            "issue_type": getattr(response, 'issue_type', 'unknown'),
+            "reasoning": response.reasoning,
+            "hallucination": getattr(response, 'hallucination_detected', False),
+            "safety": getattr(response, 'safety_issues', False)
+        }
+        st.session_state.reasoning_history[timestamp] = reasoning_data
+    
+    # Display the analysis header
     st.markdown("## 🧠 Agent Analysis")
     
     # Display hallucination and safety check results
@@ -198,13 +219,26 @@ def display_reasoning(response):
             else:
                 st.success("Response passed safety checks")
     
-    # Display reasoning steps
+    # Display reasoning steps with animation for better visibility
     if hasattr(response, 'reasoning') and response.reasoning:
         st.markdown("### 🔍 Analysis Steps")
         
-        # Create a container for reasoning steps (no expander to ensure visibility)
-        with st.container():
-            for step in response.reasoning:
+        # Create a container for reasoning steps
+        steps_container = st.container()
+        
+        # Show a progress bar to slow things down and give user time to see steps
+        progress_bar = st.progress(0)
+        
+        # Display steps with animation
+        for i, step in enumerate(response.reasoning):
+            # Update progress
+            progress = (i + 1) / len(response.reasoning)
+            progress_bar.progress(progress)
+            
+            # Slight delay for better visibility (not too much to block the UI)
+            time.sleep(0.5)
+            
+            with steps_container:
                 step_name = step.get("step", "unknown").replace("_", " ").title()
                 
                 # Create a container for each step
@@ -221,6 +255,10 @@ def display_reasoning(response):
                     
                     # Add a separator between steps
                     st.markdown("---")
+                    
+        # Complete the progress bar
+        progress_bar.progress(1.0)
+        st.success("Analysis complete! You can review these steps later in the 'Reasoning History' section.")
     else:
         st.warning("No detailed reasoning steps available for this analysis.")
 
@@ -271,48 +309,115 @@ def main():
     st.title("📊 Pipeline Doctor")
     st.markdown("Your intelligent assistant for diagnosing and fixing Databricks pipeline issues.")
     
-    # Debug section (conditional)
-    if st.session_state.get("debug_mode", False):
-        with st.expander("Debug Info", expanded=False):
-            if st.session_state.current_monitoring_response:
-                response = st.session_state.current_monitoring_response
-                st.write("Current Monitoring Response:")
-                st.write(f"- fix_successful: {response.fix_successful}")
-                st.write(f"- pending_approval: {response.pending_approval}")
-                st.write(f"- has report: {response.report is not None}")
-                st.write(f"- issue_type: {response.issue_type}")
-                st.write(f"- fix_attempts: {response.fix_attempts}")
-                st.write(f"- waiting_for_approval: {st.session_state.waiting_for_approval}")
-                st.write(f"- fix_approved: {st.session_state.fix_approved}")
-            
-            # Add live log viewer
-            st.markdown("### Recent Logs")
-            try:
-                with open("logs/agent.log", "r") as f:
-                    log_lines = f.readlines()
-                    # Show the most recent 20 log lines
-                    log_text = "".join(log_lines[-20:])
-                    st.text_area("Log Entries", log_text, height=300)
-            except Exception as e:
-                st.error(f"Error reading logs: {e}")
+    # Initialize active_tab if not set
+    if "active_tab" not in st.session_state:
+        st.session_state.active_tab = "Main Interface"
     
-    # Initialize sidebar
-    initialize_sidebar()
+    # Add tabs for main interface and reasoning history
+    tab_labels = ["Main Interface", "Reasoning History"]
+    selected_index = 0 if st.session_state.active_tab == "Main Interface" else 1
+    main_tab, history_tab = st.tabs(tab_labels)
     
-    # Initialize chat state
-    initialize_chat()
+    # Reset active_tab after selection to avoid continuous rerunning
+    current_tab = st.session_state.active_tab
+    st.session_state.active_tab = tab_labels[selected_index]
     
-    # Display the chat interface
-    display_chat_history()
-    
-    # Show approval buttons if waiting for approval
-    if st.session_state.waiting_for_approval and st.session_state.current_fix:
-        show_approval_buttons()
+    with main_tab:
+        # Debug section (conditional)
+        if st.session_state.get("debug_mode", False):
+            with st.expander("Debug Info", expanded=False):
+                if st.session_state.current_monitoring_response:
+                    response = st.session_state.current_monitoring_response
+                    st.write("Current Monitoring Response:")
+                    st.write(f"- fix_successful: {response.fix_successful}")
+                    st.write(f"- pending_approval: {response.pending_approval}")
+                    st.write(f"- has report: {response.report is not None}")
+                    st.write(f"- issue_type: {response.issue_type}")
+                    st.write(f"- fix_attempts: {response.fix_attempts}")
+                    st.write(f"- waiting_for_approval: {st.session_state.waiting_for_approval}")
+                    st.write(f"- fix_approved: {st.session_state.fix_approved}")
+                
+                # Add live log viewer
+                st.markdown("### Recent Logs")
+                try:
+                    with open("logs/agent.log", "r") as f:
+                        log_lines = f.readlines()
+                        # Show the most recent 20 log lines
+                        log_text = "".join(log_lines[-20:])
+                        st.text_area("Log Entries", log_text, height=300)
+                except Exception as e:
+                    st.error(f"Error reading logs: {e}")
         
-    # Show final report if available and fix was successful
-    if st.session_state.get("show_report", False) and st.session_state.current_monitoring_response and st.session_state.current_monitoring_response.report:
-        display_report(st.session_state.current_monitoring_response)
-        st.session_state.show_report = False
+        # Initialize sidebar
+        initialize_sidebar()
+        
+        # Initialize chat state
+        initialize_chat()
+        
+        # Display the chat interface
+        display_chat_history()
+        
+        # Show approval buttons if waiting for approval
+        if st.session_state.waiting_for_approval and st.session_state.current_fix:
+            show_approval_buttons()
+            
+        # Show final report if available and fix was successful
+        if st.session_state.get("show_report", False) and st.session_state.current_monitoring_response and st.session_state.current_monitoring_response.report:
+            display_report(st.session_state.current_monitoring_response)
+            st.session_state.show_report = False
+    
+    # Display reasoning history in a separate tab
+    with history_tab:
+        st.header("📝 Reasoning History")
+        
+        if "reasoning_history" in st.session_state and st.session_state.reasoning_history:
+            # Get available sessions in reverse chronological order
+            history_items = list(st.session_state.reasoning_history.items())
+            history_items.sort(reverse=True)  # Sort by timestamp (most recent first)
+            
+            # Create a selectbox for users to choose which analysis to view
+            timestamps = [f"{ts} - Job: {data['job_id']} - Issue: {data['issue_type']}" 
+                         for ts, data in history_items]
+            
+            selected_entry = st.selectbox(
+                "Select analysis to review:",
+                options=timestamps,
+                index=0
+            )
+            
+            if selected_entry:
+                # Extract timestamp from the selected entry
+                timestamp = selected_entry.split(" - ")[0]
+                
+                # Get the data for this timestamp
+                if timestamp in st.session_state.reasoning_history:
+                    data = st.session_state.reasoning_history[timestamp]
+                    
+                    # Display the reasoning data
+                    st.subheader(f"Analysis for Job: {data['job_id']}")
+                    st.markdown(f"**Issue Type:** {data['issue_type']}")
+                    st.markdown(f"**Analysis Time:** {data['timestamp']}")
+                    
+                    # Hallucination and safety results
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        hallucination = "Detected" if data['hallucination'] else "None"
+                        st.markdown(f"**Hallucination:** {hallucination}")
+                    with col2:
+                        safety = "Issues Found" if data['safety'] else "No Issues"
+                        st.markdown(f"**Safety:** {safety}")
+                    
+                    # Display reasoning steps
+                    st.markdown("### Reasoning Steps")
+                    
+                    for i, step in enumerate(data['reasoning']):
+                        with st.expander(f"Step {i+1}: {step.get('step', 'unknown').replace('_', ' ').title()}", expanded=False):
+                            st.markdown(f"**Details:** {step.get('details', 'No details')}")
+                            st.markdown(f"**Result:** {step.get('result', 'No result')}")
+            else:
+                st.info("Select an analysis from the dropdown to view its details")
+        else:
+            st.info("No reasoning history available yet. Run some analyses first.")
     
     # Process messages (wait for user input or handle previous requests)
     process_messages()
@@ -572,9 +677,45 @@ async def handle_message(message):
                 # Store the response in session state
                 st.session_state.current_monitoring_response = response
                 
-                # Always display agent reasoning steps
+                # Create a floating container at the bottom of the page for the reasoning button
+                floating_container = st.container()
+                
+                # Always display agent reasoning steps with animation
                 st.write("") # Add space
                 display_reasoning(response)
+                
+                # Add a floating button to view reasoning after it disappears
+                with floating_container:
+                    st.markdown(
+                        """
+                        <style>
+                        .floating-button {
+                            position: fixed;
+                            bottom: 20px;
+                            right: 20px;
+                            z-index: 1000;
+                            padding: 10px 20px;
+                            background-color: #0066cc;
+                            color: white;
+                            border-radius: 10px;
+                            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+                            text-decoration: none;
+                            font-weight: bold;
+                        }
+                        </style>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Use HTML to create the button with link to Reasoning History tab
+                    st.markdown(
+                        f"""
+                        <div class="floating-button" onclick="document.getElementById('tabs-bui3-tab-1').click();">
+                            🧠 View Reasoning Steps
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
                 
                 # If issue detected, show diagnosis and fix suggestions
                 if response.issue_detected:
@@ -594,6 +735,13 @@ async def handle_message(message):
                     # Add full message with context
                     diagnosis_message = f"{issue_message}{evidence_text}{details_text}"
                     
+                    # Save timestamp for reasoning
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Add a button key to session state
+                    button_key = f"reasoning_btn_{timestamp}"
+                    st.session_state[button_key] = False
+                    
                     # Check if there's a suggested fix waiting for approval
                     if response.suggested_fix:
                         # Store the fix for approval
@@ -603,7 +751,7 @@ async def handle_message(message):
                         # Add explanation message about the issue first
                         st.session_state.messages.append({
                             "role": "assistant", 
-                            "content": diagnosis_message
+                            "content": f"{diagnosis_message}\n\n[View Reasoning Steps](#reasoning)"
                         })
                         
                         logger.info("Waiting for user approval of fix...")
@@ -611,7 +759,7 @@ async def handle_message(message):
                         # Just show the diagnosis
                         st.session_state.messages.append({
                             "role": "assistant", 
-                            "content": diagnosis_message
+                            "content": f"{diagnosis_message}\n\n[View Reasoning Steps](#reasoning)"
                         })
                 else:
                     # No issues detected
@@ -711,6 +859,20 @@ def initialize_sidebar():
             st.session_state.process_monitor = True
             st.rerun()
     
+    # Reasoning History section
+    st.sidebar.header("Analysis History")
+    
+    # Count number of analyses in history
+    history_count = 0
+    if "reasoning_history" in st.session_state:
+        history_count = len(st.session_state.reasoning_history)
+    
+    # Add a button to view reasoning history
+    if st.sidebar.button(f"View Reasoning History ({history_count} analyses)", key="view_history_button"):
+        # Set a session state flag to switch to the history tab
+        st.session_state.active_tab = "Reasoning History"
+        st.rerun()
+    
     # Debug mode toggle
     st.sidebar.header("Developer Options")
     st.session_state.debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
@@ -737,6 +899,48 @@ def initialize_chat():
             "role": "assistant",
             "content": "👋 I'm Pipeline Doctor, your AI assistant for diagnosing and fixing Databricks pipeline issues. How can I help you today?"
         })
+
+# Function to show reasoning in a popup dialog
+def show_reasoning_popup():
+    """Display reasoning steps in a popup dialog"""
+    if "current_monitoring_response" in st.session_state and st.session_state.current_monitoring_response:
+        response = st.session_state.current_monitoring_response
+        
+        if hasattr(response, 'reasoning') and response.reasoning:
+            # Create a dialog using st.dialog (Streamlit 1.31+)
+            try:
+                with st.expander("🧠 Reasoning Steps", expanded=True):
+                    # Display the reasoning steps
+                    for i, step in enumerate(response.reasoning):
+                        step_name = step.get("step", "unknown").replace("_", " ").title()
+                        st.markdown(f"### Step {i+1}: {step_name}")
+                        
+                        # Display details if available
+                        if "details" in step and step["details"]:
+                            st.markdown(step["details"])
+                        
+                        # Display result in a different color/style
+                        if "result" in step:
+                            st.success(f"Result: {step['result']}")
+                        
+                        # Add a separator between steps (except for the last one)
+                        if i < len(response.reasoning) - 1:
+                            st.markdown("---")
+            except:
+                # Fallback for older Streamlit versions
+                st.markdown("### 🧠 Reasoning Steps")
+                
+                for i, step in enumerate(response.reasoning):
+                    step_name = step.get("step", "unknown").replace("_", " ").title()
+                    with st.expander(f"Step {i+1}: {step_name}", expanded=False):
+                        if "details" in step and step["details"]:
+                            st.markdown(step["details"])
+                        if "result" in step:
+                            st.success(f"Result: {step['result']}")
+        else:
+            st.warning("No reasoning steps available for the current analysis.")
+    else:
+        st.warning("No current analysis available. Please run a diagnosis first.")
 
 if __name__ == "__main__":
     # Initial logging setup
