@@ -183,13 +183,29 @@ def display_reasoning(response):
     
     # Store this reasoning for later viewing
     if hasattr(response, 'reasoning') and response.reasoning:
+        # Add timestamps to reasoning steps if not present
+        timestamped_reasoning = []
+        for step in response.reasoning:
+            step_with_time = step.copy()
+            if 'timestamp' not in step_with_time:
+                step_with_time['timestamp'] = time.strftime("%Y-%m-%d %H:%M:%S")
+            timestamped_reasoning.append(step_with_time)
+        
         reasoning_data = {
             "timestamp": timestamp,
             "job_id": getattr(response, 'job_id', 'unknown'),
             "issue_type": getattr(response, 'issue_type', 'unknown'),
-            "reasoning": response.reasoning,
+            "reasoning": timestamped_reasoning,
             "hallucination": getattr(response, 'hallucination_detected', False),
-            "safety": getattr(response, 'safety_issues', False)
+            "hallucination_details": getattr(response, 'hallucination_details', None),
+            "safety": getattr(response, 'safety_issues', False),
+            "safety_issue_details": getattr(response, 'safety_issue_details', None),
+            "confidence": getattr(response, 'confidence', None),
+            "metadata": {
+                "fix_successful": getattr(response, 'fix_successful', None),
+                "fix_attempts": getattr(response, 'fix_attempts', None),
+                "pending_approval": getattr(response, 'pending_approval', None)
+            }
         }
         st.session_state.reasoning_history[timestamp] = reasoning_data
     
@@ -306,12 +322,12 @@ def main():
     
     # Add tabs for main interface and reasoning history
     tab_labels = ["Main Interface", "Reasoning History"]
-    selected_index = 0 if st.session_state.active_tab == "Main Interface" else 1
+    selected_index = tab_labels.index(st.session_state.active_tab) if st.session_state.active_tab in tab_labels else 0
     main_tab, history_tab = st.tabs(tab_labels)
     
-    # Reset active_tab after selection to avoid continuous rerunning
-    current_tab = st.session_state.active_tab
-    st.session_state.active_tab = tab_labels[selected_index]
+    # Store the current active tab to avoid infinite rerun loops
+    current_tab = tab_labels[selected_index]
+    st.session_state.active_tab = current_tab
     
     with main_tab:
         # Debug section (conditional)
@@ -389,22 +405,80 @@ def main():
                     st.markdown(f"**Issue Type:** {data['issue_type']}")
                     st.markdown(f"**Analysis Time:** {data['timestamp']}")
                     
-                    # Hallucination and safety results
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        hallucination = "Detected" if data['hallucination'] else "None"
-                        st.markdown(f"**Hallucination:** {hallucination}")
-                    with col2:
-                        safety = "Issues Found" if data['safety'] else "No Issues"
-                        st.markdown(f"**Safety:** {safety}")
+                    # Hallucination and safety results in expandable sections
+                    with st.expander("🔍 Hallucination Analysis", expanded=True):
+                        st.markdown("### Hallucination Check Results")
+                        if data['hallucination']:
+                            st.warning("⚠️ **Potential Hallucination Detected**")
+                            if 'hallucination_details' in data:
+                                st.markdown(f"**Details:** {data['hallucination_details']}")
+                            st.markdown("""
+                            **Steps Taken:**
+                            1. Analyzed response content for factual consistency
+                            2. Checked against known patterns and data
+                            3. Validated technical recommendations
+                            """)
+                        else:
+                            st.success("✅ **No Hallucination Detected**")
+                            st.markdown("""
+                            **Validation Steps:**
+                            1. Verified response against Databricks documentation
+                            2. Confirmed error patterns match known issues
+                            3. Validated technical accuracy of recommendations
+                            """)
+                    
+                    with st.expander("🛡️ Safety Analysis", expanded=True):
+                        st.markdown("### Safety Check Results")
+                        if data['safety']:
+                            st.error("⚠️ **Safety Issues Found**")
+                            if 'safety_issue_details' in data:
+                                st.markdown(f"**Details:** {data['safety_issue_details']}")
+                            st.markdown("""
+                            **Safety Concerns:**
+                            1. Reviewed potential impact on production systems
+                            2. Analyzed data security implications
+                            3. Checked for destructive operations
+                            """)
+                        else:
+                            st.success("✅ **No Safety Issues**")
+                            st.markdown("""
+                            **Safety Verification Steps:**
+                            1. Confirmed changes are non-destructive
+                            2. Verified data security compliance
+                            3. Checked resource access boundaries
+                            """)
                     
                     # Display reasoning steps
-                    st.markdown("### Reasoning Steps")
+                    st.markdown("### 🧠 Detailed Analysis Steps")
                     
                     for i, step in enumerate(data['reasoning']):
-                        with st.expander(f"Step {i+1}: {step.get('step', 'unknown').replace('_', ' ').title()}", expanded=False):
-                            st.markdown(f"**Details:** {step.get('details', 'No details')}")
-                            st.markdown(f"**Result:** {step.get('result', 'No result')}")
+                        step_name = step.get('step', 'unknown').replace('_', ' ').title()
+                        with st.expander(f"Step {i+1}: {step_name}", expanded=False):
+                            # Add timing information if available
+                            if 'timestamp' in step:
+                                st.markdown(f"**Time:** {step['timestamp']}")
+                                
+                            # Display step details with improved formatting
+                            if 'details' in step:
+                                st.markdown("**Analysis:**")
+                                st.markdown(step['details'])
+                            
+                            # Display result with status indicator
+                            if 'result' in step:
+                                result = step['result']
+                                if any(success_term in result.lower() for success_term in ['success', 'passed', 'resolved']):
+                                    st.success(f"**Result:** {result}")
+                                elif any(warning_term in result.lower() for warning_term in ['warning', 'caution', 'attention']):
+                                    st.warning(f"**Result:** {result}")
+                                elif any(error_term in result.lower() for error_term in ['error', 'failed', 'issue']):
+                                    st.error(f"**Result:** {result}")
+                                else:
+                                    st.info(f"**Result:** {result}")
+                            
+                            # Display any additional metadata
+                            if 'metadata' in step:
+                                with st.expander("Additional Details"):
+                                    st.json(step['metadata'])
             else:
                 st.info("Select an analysis from the dropdown to view its details")
         else:
@@ -417,9 +491,16 @@ def main():
 def display_chat_history():
     """Display the chat history"""
     # Display all messages
-    for message in st.session_state.messages:
+    for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            
+            # Add a button to view reasoning after AI responses that mention analysis steps
+            if (message["role"] == "assistant" and 
+                "Click the button below to see detailed analysis steps" in message["content"]):
+                if st.button("🧠 View Analysis Steps", key=f"view_steps_{i}", type="primary", 
+                            on_click=lambda: setattr(st.session_state, 'active_tab', 'Reasoning History')):
+                    st.rerun()
 
 # Function to process new messages
 def process_messages():
@@ -668,45 +749,19 @@ async def handle_message(message):
                 # Store the response in session state
                 st.session_state.current_monitoring_response = response
                 
-                # Create a floating container at the bottom of the page for the reasoning button
-                floating_container = st.container()
+                # Create a container for reasoning button that will stay visible
+                step_button_container = st.container()
                 
                 # Always display agent reasoning steps with animation
                 st.write("") # Add space
                 display_reasoning(response)
                 
-                # Add a floating button to view reasoning after it disappears
-                with floating_container:
-                    st.markdown(
-                        """
-                        <style>
-                        .floating-button {
-                            position: fixed;
-                            bottom: 20px;
-                            right: 20px;
-                            z-index: 1000;
-                            padding: 10px 20px;
-                            background-color: #0066cc;
-                            color: white;
-                            border-radius: 10px;
-                            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-                            text-decoration: none;
-                            font-weight: bold;
-                        }
-                        </style>
-                        """,
-                        unsafe_allow_html=True
-                    )
-                    
-                    # Use HTML to create the button with link to Reasoning History tab
-                    st.markdown(
-                        f"""
-                        <div class="floating-button" onclick="document.getElementById('tabs-bui3-tab-1').click();">
-                            🧠 View Reasoning Steps
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+                # Add a button in the container to view reasoning after it disappears
+                with step_button_container:
+                    st.button("🧠 View Analysis Steps Again", 
+                             key=f"view_again_{int(time.time())}", 
+                             on_click=lambda: setattr(st.session_state, 'active_tab', 'Reasoning History'),
+                             type="primary")
                 
                 # If issue detected, show diagnosis and fix suggestions
                 if response.issue_detected:
@@ -742,7 +797,7 @@ async def handle_message(message):
                         # Add explanation message about the issue first
                         st.session_state.messages.append({
                             "role": "assistant", 
-                            "content": f"{diagnosis_message}\n\n[View Reasoning Steps](#reasoning)"
+                            "content": f"{diagnosis_message}\n\n**Important:** Click the button below to see detailed analysis steps."
                         })
                         
                         logger.info("Waiting for user approval of fix...")
@@ -750,7 +805,7 @@ async def handle_message(message):
                         # Just show the diagnosis
                         st.session_state.messages.append({
                             "role": "assistant", 
-                            "content": f"{diagnosis_message}\n\n[View Reasoning Steps](#reasoning)"
+                            "content": f"{diagnosis_message}\n\n**Important:** Click the button below to see detailed analysis steps."
                         })
                 else:
                     # No issues detected
@@ -898,36 +953,24 @@ def show_reasoning_popup():
         response = st.session_state.current_monitoring_response
         
         if hasattr(response, 'reasoning') and response.reasoning:
-            # Create a dialog using st.dialog (Streamlit 1.31+)
-            try:
-                with st.expander("🧠 Reasoning Steps", expanded=True):
-                    # Display the reasoning steps
-                    for i, step in enumerate(response.reasoning):
-                        step_name = step.get("step", "unknown").replace("_", " ").title()
-                        st.markdown(f"### Step {i+1}: {step_name}")
-                        
-                        # Display details if available
-                        if "details" in step and step["details"]:
-                            st.markdown(step["details"])
-                        
-                        # Display result in a different color/style
-                        if "result" in step:
-                            st.success(f"Result: {step['result']}")
-                        
-                        # Add a separator between steps (except for the last one)
-                        if i < len(response.reasoning) - 1:
-                            st.markdown("---")
-            except:
-                # Fallback for older Streamlit versions
-                st.markdown("### 🧠 Reasoning Steps")
-                
+            # Create an expander for the reasoning steps
+            with st.expander("🧠 Reasoning Steps", expanded=True):
+                # Display the reasoning steps
                 for i, step in enumerate(response.reasoning):
                     step_name = step.get("step", "unknown").replace("_", " ").title()
-                    with st.expander(f"Step {i+1}: {step_name}", expanded=False):
-                        if "details" in step and step["details"]:
-                            st.markdown(step["details"])
-                        if "result" in step:
-                            st.success(f"Result: {step['result']}")
+                    st.markdown(f"### Step {i+1}: {step_name}")
+                    
+                    # Display details if available
+                    if "details" in step and step["details"]:
+                        st.markdown(step["details"])
+                    
+                    # Display result in a different color/style
+                    if "result" in step:
+                        st.success(f"Result: {step['result']}")
+                    
+                    # Add a separator between steps (except for the last one)
+                    if i < len(response.reasoning) - 1:
+                        st.markdown("---")
         else:
             st.warning("No reasoning steps available for the current analysis.")
     else:

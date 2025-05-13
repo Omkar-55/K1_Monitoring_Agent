@@ -389,6 +389,9 @@ def _simulate_diagnosis(failure_type_str: Optional[str] = None) -> Dict[str, Any
             }
         ]
         
+        # Print debug info for memory error response
+        print(f"DEBUG _simulate_diagnosis: Created memory_reasoning with {len(memory_reasoning)} steps")
+        
         return {
             "issue_type": failure_type.value,
             "confidence": 0.85,
