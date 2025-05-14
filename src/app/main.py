@@ -136,14 +136,20 @@ async def process_monitoring_job(job_id, run_id=None, approved_fix=None, simulat
         
         logger.info(f"Processing monitoring job: {job_id}")
         
-        # Check if we should use random failure type
-        if simulate and failure_type == "random":
-            # Don't specify a type, let the system choose randomly
-            failure_type = None
-            logger.info("Using random failure type for simulation")
-        elif simulate:
-            # Log the explicit failure type for debugging
-            logger.info(f"Using explicit failure type for simulation: {failure_type}")
+        # Handle simulation settings
+        if simulate:
+            if not failure_type or failure_type == "random":
+                logger.info("Using random failure type for simulation")
+                failure_type = None  # Let the system choose randomly
+            else:
+                logger.info(f"Using explicit failure type for simulation: {failure_type}")
+                # Ensure failure type is in the correct format
+                if failure_type in ["memory", "memory_error", "out_of_memory", "oom"]:
+                    failure_type = "memory_exceeded"
+                elif failure_type in ["disk", "disk_error", "space", "storage"]:
+                    failure_type = "disk_space_exceeded"
+                elif failure_type in ["depend", "dependency", "package", "import", "library"]:
+                    failure_type = "dependency_error"
         
         # Generate a unique conversation ID if needed
         if not st.session_state.get("conversation_id"):
@@ -720,17 +726,39 @@ async def handle_message(message):
             return
         
         if job_id or re.search(r'(?i)simulate|test|try', message):
-            # Get simulation settings from sidebar
-            simulate = st.session_state.get("simulate", False)
-            failure_type = st.session_state.get("failure_type", None) if simulate else None
+            # Initialize simulate and failure_type from sidebar settings first
+            sidebar_simulate = st.session_state.get("simulate", False)
+            sidebar_failure_type = st.session_state.get("failure_type", "random") if sidebar_simulate else None
+
+            # Default to sidebar settings
+            simulate = sidebar_simulate
+            failure_type = sidebar_failure_type
+            
+            # Check for simulation keywords and specific failure types in the chat message
+            # These will override sidebar settings if present
+            chat_requests_simulation = bool(re.search(r'(?i)simulate|test|try', message))
+            
+            if chat_requests_simulation:
+                simulate = True # Ensure simulation is on if chat requests it
+                # Try to parse a specific failure type from the chat message
+                if re.search(r'(?i)memory|out\\s+of\\s+memory|oom', message):
+                    failure_type = "memory_exceeded"
+                elif re.search(r'(?i)disk|space|storage', message):
+                    failure_type = "disk_space_exceeded"
+                elif re.search(r'(?i)depend|package|import|library', message):
+                    failure_type = "dependency_error"
+                elif failure_type is None: # If chat asks to simulate but gives no type, and sidebar had no type
+                    failure_type = "random"
+                # If chat says "simulate" but gives no type, and sidebar *did* have a type,
+                # we keep the sidebar_failure_type (already assigned to failure_type)
             
             # If job ID found, start monitoring process
             if job_id:
                 # Display thinking message
                 with st.chat_message("assistant"):
                     st.markdown(f"Starting monitoring for job ID: `{job_id}`...")
-                    if simulate:
-                        st.markdown(f"*Simulation mode enabled with failure type: {failure_type}*")
+                    if simulate: # Now 'simulate' reflects combined logic
+                        st.markdown(f"*Simulation mode enabled with failure type: {failure_type or 'random'}*")
                 
                 # Reset for new monitoring session
                 st.session_state.current_monitoring_response = None

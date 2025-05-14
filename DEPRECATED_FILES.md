@@ -9,9 +9,15 @@ The following files have been removed in the latest cleanup (Production Release)
 - `test_streamlit.py` - Test file for UI components (now implemented in main.py)
 - `fix_streamlit.py` - Test file for UI fixes (no longer needed)
 - `debug_reasoning.json` - Debug file (not needed in production)
-- `simple_agent_cli.py` - CLI version (superseded by Streamlit app)
+- `simple_agent_cli.py` - CLI version (superseded by Streamlit app, but core CLI functionality preserved in `src/cli.py`)
 - `agent_visualizer.py` - Visualization tool (integrated into main app)
 - `monitor_job.py` - Standalone monitoring script (integrated into main app)
+
+## Retained Core Files
+
+The following files were initially considered for removal but are retained for specific purposes:
+
+- `src/cli.py` - Core command-line interface for programmatic access and automation (not deprecated)
 
 ## Previously Removed Files
 
@@ -39,7 +45,7 @@ The following test files were properly migrated or removed:
 
 All tests should now be organized in the `tests/` directory following this structure:
 - `tests/unit/` - Unit tests
-- `tests/integration/` - Integration tests
+- `tests/integration/` - Integration tests (including `test_monitoring_agent.py`)
 - `tests/e2e/` - End-to-end tests
 
 ## Next Steps
